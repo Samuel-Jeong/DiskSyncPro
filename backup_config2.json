@@ -2,9 +2,9 @@
   "jobs": [
     {
       "name": "WORK-to-WORK_BACKUP",
-      "source": "/Volumes/WORK",
-      "destination": "/Volumes/WORK_BACKUP/WORK_20251204",
-      "mode": "safety_net",
+      "source": "/Volumes/WORK/GIT_PROJECTS",
+      "destination": "/Volumes/WORK_BACKUP/WORK_GIT_PROJECTS_20251205",
+      "mode": "sync",
       "exclude": [
         ".DS_Store",
         ".Spotlight-V100",
