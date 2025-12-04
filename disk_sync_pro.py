@@ -124,23 +124,42 @@ def cleanup_old_logs(log_dir: Path, keep_days: int = 30):
         if not log_dir.exists():
             return
         
+        if keep_days < 1:
+            logger.warning("keep_days는 최소 1일 이상이어야 합니다")
+            return
+        
         from datetime import timedelta
         cutoff_date = datetime.now() - timedelta(days=keep_days)
         
         deleted_count = 0
+        error_count = 0
+        
         for log_file in log_dir.glob("disk_sync_pro_*.log"):
             try:
+                # 파일이 일반 파일인지 확인
+                if not log_file.is_file():
+                    continue
+                
                 # 파일 수정 시간 확인
                 mtime = datetime.fromtimestamp(log_file.stat().st_mtime)
                 
                 if mtime < cutoff_date:
                     log_file.unlink()
                     deleted_count += 1
-            except Exception:
+                    logger.debug(f"로그 파일 삭제: {log_file.name} (수정: {mtime.strftime('%Y-%m-%d')})")
+            except (IOError, OSError, PermissionError) as e:
+                logger.debug(f"로그 파일 삭제 실패: {log_file} - {e}")
+                error_count += 1
+                continue
+            except Exception as e:
+                logger.debug(f"로그 파일 처리 중 예외: {log_file} - {e}")
+                error_count += 1
                 continue
         
         if deleted_count > 0:
-            logger.info(f"오래된 로그 파일 {deleted_count}개 삭제 (보관기간: {keep_days}일)")
+            logger.info(f"✓ 오래된 로그 파일 {deleted_count}개 삭제 (보관기간: {keep_days}일)")
+        if error_count > 0:
+            logger.warning(f"로그 파일 정리 중 {error_count}개 파일 처리 실패")
     except Exception as e:
         logger.warning(f"로그 파일 정리 실패: {e}")
 
@@ -165,34 +184,63 @@ class SingleInstanceLock:
         """
         try:
             # Lock 파일 생성 (디렉토리가 없으면 생성)
-            self.lock_file.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                self.lock_file.parent.mkdir(parents=True, exist_ok=True)
+            except (IOError, OSError, PermissionError) as e:
+                logger.error(f"Lock 디렉토리 생성 실패: {e}")
+                return False
             
             # 파일 열기 (O_CREAT | O_RDWR)
-            self.lock_fd = open(self.lock_file, 'w')
+            try:
+                self.lock_fd = open(self.lock_file, 'w')
+            except (IOError, OSError, PermissionError) as e:
+                logger.error(f"Lock 파일 생성 실패: {e}")
+                return False
             
             # Non-blocking lock 시도
-            fcntl.flock(self.lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                fcntl.flock(self.lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (IOError, OSError) as e:
+                # Lock 획득 실패 (이미 다른 프로세스가 실행 중)
+                if self.lock_fd:
+                    try:
+                        self.lock_fd.close()
+                    except Exception:
+                        pass
+                    self.lock_fd = None
+                return False
             
             # Lock 파일에 PID 기록 (flush 필수)
-            self.lock_fd.write(f"{os.getpid()}\n")
-            self.lock_fd.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            self.lock_fd.flush()
+            try:
+                self.lock_fd.write(f"{os.getpid()}\n")
+                self.lock_fd.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                self.lock_fd.flush()
+                os.fsync(self.lock_fd.fileno())  # 디스크에 확실히 쓰기
+            except Exception as e:
+                logger.warning(f"Lock 파일 쓰기 실패 (계속 진행): {e}")
             
             # 별도 PID 파일에도 기록 (다른 프로세스가 쉽게 읽을 수 있도록)
             try:
                 with open(self.pid_file, 'w') as pf:
                     pf.write(f"{os.getpid()}\n")
                     pf.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            except Exception:
+                    pf.flush()
+                    os.fsync(pf.fileno())
+            except Exception as e:
+                logger.debug(f"PID 파일 생성 실패 (무시): {e}")
                 pass  # PID 파일 실패해도 lock은 성공
             
             # 프로그램 종료 시 자동으로 lock 해제
             atexit.register(self.release)
             
             return True
-        except (IOError, OSError) as e:
+        except Exception as e:
+            logger.error(f"Lock 획득 중 예외: {e}")
             if self.lock_fd:
-                self.lock_fd.close()
+                try:
+                    self.lock_fd.close()
+                except Exception:
+                    pass
                 self.lock_fd = None
             return False
     
@@ -674,27 +722,72 @@ class CursesLogHandler(logging.Handler):
 def load_config(config_path: Path) -> List[BackupJob]:
     """
     JSON 설정 파일을 읽어 BackupJob 리스트 생성
+    검증 로직 포함
     """
-    with config_path.open("r", encoding="utf-8") as f:
-        raw = json.load(f)
+    try:
+        with config_path.open("r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"JSON 파싱 실패 {config_path}: {e}")
+    except (IOError, OSError) as e:
+        raise IOError(f"Config 파일 읽기 실패 {config_path}: {e}")
 
     # config 파일명을 그룹 이름으로 사용 (확장자 제외)
     config_name = config_path.stem  # 예: "backup_config" from "backup_config.json"
     
+    if "jobs" not in raw:
+        raise ValueError(f"Config 파일에 'jobs' 키가 없습니다: {config_path}")
+    
+    if not isinstance(raw["jobs"], list):
+        raise ValueError(f"'jobs'는 리스트여야 합니다: {config_path}")
+    
     jobs: List[BackupJob] = []
-    for job in raw.get("jobs", []):
+    for idx, job in enumerate(raw.get("jobs", [])):
+        # 필수 필드 검증
+        required_fields = ["name", "source", "destination"]
+        for field in required_fields:
+            if field not in job:
+                raise ValueError(f"Job {idx}: 필수 필드 '{field}'가 없습니다")
+        
+        # 모드 검증
+        mode = job.get("mode", "safety_net")
+        if mode not in ("clone", "sync", "safety_net"):
+            raise ValueError(f"Job {idx} ({job['name']}): 유효하지 않은 mode '{mode}'")
+        
+        # 경로 검증
+        try:
+            source = Path(job["source"]).expanduser().resolve()
+            destination = Path(job["destination"]).expanduser().resolve()
+        except Exception as e:
+            raise ValueError(f"Job {idx} ({job['name']}): 경로 처리 실패 - {e}")
+        
+        # source와 destination이 같은 경로인지 체크
+        if source == destination:
+            raise ValueError(f"Job {idx} ({job['name']}): source와 destination이 같습니다")
+        
+        # destination이 source의 하위 디렉토리인지 체크
+        try:
+            destination.relative_to(source)
+            raise ValueError(f"Job {idx} ({job['name']}): destination이 source의 하위 디렉토리입니다")
+        except ValueError:
+            pass  # 정상 (하위 디렉토리 아님)
+        
         jobs.append(
             BackupJob(
                 name=job["name"],
-                source=Path(job["source"]).expanduser(),
-                destination=Path(job["destination"]).expanduser(),
-                mode=job.get("mode", "safety_net"),
+                source=source,
+                destination=destination,
+                mode=mode,
                 exclude=job.get("exclude", []),
-                safety_net_days=job.get("safety_net_days", 30),
+                safety_net_days=max(1, job.get("safety_net_days", 30)),  # 최소 1일
                 verify=job.get("verify", False),
-                config_name=config_name,  # config 이름 추가
+                config_name=config_name,
             )
         )
+    
+    if not jobs:
+        raise ValueError(f"Config 파일에 유효한 job이 없습니다: {config_path}")
+    
     return jobs
 
 
@@ -717,44 +810,86 @@ def path_matches_patterns(path: Path, patterns: List[str]) -> bool:
 
 def file_hash(path: Path, algo: str = HASH_ALGO, chunk_size: int = 1024 * 1024) -> str:
     """파일 해시 계산 (검증용)"""
-    h = hashlib.new(algo)
-    with path.open("rb") as f:
-        while True:
-            chunk = f.read(chunk_size)
-            if not chunk:
-                break
-            h.update(chunk)
-    return h.hexdigest()
+    try:
+        h = hashlib.new(algo)
+        with path.open("rb") as f:
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()
+    except (IOError, OSError) as e:
+        raise IOError(f"파일 해시 계산 실패 {path}: {e}")
 
 
 def is_same_file(src: Path, dst: Path) -> bool:
     """
     성능 우선: 파일 크기 + mtime 으로 동일 여부 판단
     """
-    if not dst.exists():
+    try:
+        if not dst.exists():
+            return False
+        if not src.exists():
+            return False
+        # 심볼릭 링크는 제외
+        if src.is_symlink() or dst.is_symlink():
+            return False
+        # 일반 파일만 비교
+        if not src.is_file() or not dst.is_file():
+            return False
+        s_stat = src.stat()
+        d_stat = dst.stat()
+        return (s_stat.st_size == d_stat.st_size) and (int(s_stat.st_mtime) == int(d_stat.st_mtime))
+    except (IOError, OSError, PermissionError):
         return False
-    s_stat = src.stat()
-    d_stat = dst.stat()
-    return (s_stat.st_size == d_stat.st_size) and (int(s_stat.st_mtime) == int(d_stat.st_mtime))
 
 
 def atomic_copy(src: Path, dst: Path) -> None:
     """
     임시 파일에 복사 후 os.replace 로 교체하는 원자적(atomic) 복사.
     """
+    # 소스 파일 검증
+    if not src.exists():
+        raise IOError(f"소스 파일이 존재하지 않음: {src}")
+    if src.is_symlink():
+        raise IOError(f"심볼릭 링크는 복사할 수 없음: {src}")
+    if not src.is_file():
+        raise IOError(f"일반 파일이 아님: {src}")
+    
+    # 대상 디렉토리 생성
     dst_parent = dst.parent
-    dst_parent.mkdir(parents=True, exist_ok=True)
-    tmp_name = f".{dst.name}.sbk_tmp_{os.getpid()}"
+    try:
+        dst_parent.mkdir(parents=True, exist_ok=True)
+    except (IOError, OSError, PermissionError) as e:
+        raise IOError(f"대상 디렉토리 생성 실패 {dst_parent}: {e}")
+    
+    # 임시 파일 경로
+    tmp_name = f".{dst.name}.sbk_tmp_{os.getpid()}_{int(time.time() * 1000000)}"
     tmp_path = dst_parent / tmp_name
 
+    # 기존 임시 파일 정리 (안전하게)
     try:
         if tmp_path.exists():
             tmp_path.unlink()
-    except Exception:
-        pass
+    except (IOError, OSError, PermissionError):
+        # 다른 이름으로 시도
+        tmp_name = f".{dst.name}.sbk_tmp_{os.getpid()}_{int(time.time() * 1000000)}_alt"
+        tmp_path = dst_parent / tmp_name
 
-    shutil.copy2(src, tmp_path)
-    os.replace(tmp_path, dst)
+    try:
+        # 복사 실행
+        shutil.copy2(src, tmp_path)
+        # 원자적 교체
+        os.replace(tmp_path, dst)
+    except Exception as e:
+        # 실패 시 임시 파일 정리
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
+        raise IOError(f"원자적 복사 실패 {src} -> {dst}: {e}")
 
 
 def ensure_dir(path: Path, journal: Optional[Journal] = None,
@@ -762,16 +897,26 @@ def ensure_dir(path: Path, journal: Optional[Journal] = None,
     """
     디렉토리 생성. 롤백을 위해 create_dir 기록.
     """
-    if path.exists():
-        return
-    logger.info(f"[MKDIR] {path}")
-    if dry_run:
-        return
-    path.mkdir(parents=True, exist_ok=True)
-    if journal:
-        journal.ops.append(JournalOp(action="create_dir", target=str(path)))
-    if stats:
-        stats.created_dirs += 1
+    try:
+        if path.exists():
+            if not path.is_dir():
+                logger.error(f"경로가 디렉토리가 아닙니다: {path}")
+                raise IOError(f"경로가 디렉토리가 아닙니다: {path}")
+            return
+        
+        logger.info(f"[MKDIR] {path}")
+        if dry_run:
+            return
+        
+        path.mkdir(parents=True, exist_ok=True)
+        
+        if journal:
+            journal.ops.append(JournalOp(action="create_dir", target=str(path)))
+        if stats:
+            stats.created_dirs += 1
+    except (IOError, OSError, PermissionError) as e:
+        logger.error(f"디렉토리 생성 실패 {path}: {e}")
+        raise
 
 
 # ================ SafetyNet / Rollback 영역 =================
@@ -788,28 +933,53 @@ def move_to_safety_net(target: Path, dest_root: Path, dry_run: bool = False) -> 
     삭제/덮어쓰기 대상 파일을 SafetyNet으로 이동
     """
     sn_root = get_safety_net_dir(dest_root)
+    
+    # 상대 경로 계산
     try:
         rel = target.relative_to(dest_root)
     except ValueError:
-        rel = Path(target.name)
+        # dest_root 밖의 파일인 경우, 안전한 경로 생성
+        # target의 절대 경로를 base64로 인코딩하여 충돌 방지
+        import base64
+        safe_name = base64.urlsafe_b64encode(str(target.resolve()).encode()).decode()
+        rel = Path("external") / safe_name[:50] / target.name  # 길이 제한
 
     sn_path = sn_root / rel
+    
+    # 이미 같은 이름이 있으면 타임스탬프 추가
+    if sn_path.exists() and not dry_run:
+        timestamp_suffix = f"_{int(time.time() * 1000000)}"
+        sn_path = sn_path.with_stem(sn_path.stem + timestamp_suffix)
+    
     logger.info(f"[SafetyNet] {target} -> {sn_path}")
+    
     if not dry_run:
-        sn_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(target), str(sn_path))
+        try:
+            sn_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(target), str(sn_path))
+        except (IOError, OSError, PermissionError) as e:
+            logger.error(f"SafetyNet 이동 실패 {target} -> {sn_path}: {e}")
+            raise
+    
     return sn_path
 
 
 def prepare_journal(job: BackupJob) -> Journal:
+    """저널 준비 (롤백 디렉토리 생성 포함)"""
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     rollback_root = job.destination / ".Rollback" / f"{job.name}_{ts}"
-    rollback_root.mkdir(parents=True, exist_ok=True)
+    
+    try:
+        rollback_root.mkdir(parents=True, exist_ok=True)
+    except (IOError, OSError, PermissionError) as e:
+        logger.error(f"롤백 디렉토리 생성 실패: {e}")
+        raise IOError(f"롤백 디렉토리 생성 실패 {rollback_root}: {e}")
+    
     return Journal(
         job_name=job.name,
         timestamp=ts,
-        dest_root=str(job.destination),
-        rollback_root=str(rollback_root),
+        dest_root=str(job.destination.resolve()),
+        rollback_root=str(rollback_root.resolve()),
         status="pending",
         ops=[],
     )
@@ -834,7 +1004,7 @@ def get_dest_meta_dir(destination_root: Path) -> Path:
 
 
 def save_journal(journal: Journal, path: Path, destination_root: Optional[Path] = None) -> None:
-    """저널을 logs 폴더와 타겟 폴더 모두에 저장"""
+    """저널을 logs 폴더와 타겟 폴더 모두에 저장 (원자적 쓰기)"""
     serializable = {
         "job_name": journal.job_name,
         "timestamp": journal.timestamp,
@@ -843,26 +1013,68 @@ def save_journal(journal: Journal, path: Path, destination_root: Optional[Path] 
         "status": journal.status,
         "ops": [asdict(op) for op in journal.ops],
     }
-    # logs 폴더에 저장
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(serializable, f, indent=2, ensure_ascii=False)
     
-    # 타겟 폴더에도 저장
+    # logs 폴더에 저장 (원자적)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix('.tmp')
+        with tmp_path.open("w", encoding="utf-8") as f:
+            json.dump(serializable, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except Exception as e:
+        logger.error(f"저널 저장 실패 {path}: {e}")
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
+    
+    # 타겟 폴더에도 저장 (원자적)
     if destination_root and destination_root.exists():
         try:
             dest_meta_dir = get_dest_meta_dir(destination_root)
             dest_journal_path = dest_meta_dir / path.name
-            with dest_journal_path.open("w", encoding="utf-8") as f:
+            dest_tmp_path = dest_journal_path.with_suffix('.tmp')
+            
+            with dest_tmp_path.open("w", encoding="utf-8") as f:
                 json.dump(serializable, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(dest_tmp_path, dest_journal_path)
             logger.info(f"저널 복사본 저장: {dest_journal_path}")
         except Exception as e:
             logger.warning(f"타겟 폴더 저널 저장 실패: {e}")
+            try:
+                if dest_tmp_path.exists():
+                    dest_tmp_path.unlink()
+            except Exception:
+                pass
 
 
 def load_journal(path: Path) -> Journal:
-    with path.open("r", encoding="utf-8") as f:
-        raw = json.load(f)
-    ops = [JournalOp(**op) for op in raw.get("ops", [])]
+    """저널 파일 로드 (검증 포함)"""
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"저널 JSON 파싱 실패 {path}: {e}")
+    except (IOError, OSError) as e:
+        raise IOError(f"저널 파일 읽기 실패 {path}: {e}")
+    
+    # 필수 필드 검증
+    required_fields = ["job_name", "timestamp", "dest_root", "rollback_root"]
+    for field in required_fields:
+        if field not in raw:
+            raise ValueError(f"저널 파일에 필수 필드 '{field}'가 없습니다: {path}")
+    
+    # ops 파싱
+    try:
+        ops = [JournalOp(**op) for op in raw.get("ops", [])]
+    except Exception as e:
+        raise ValueError(f"저널 ops 파싱 실패 {path}: {e}")
+    
     return Journal(
         job_name=raw["job_name"],
         timestamp=raw["timestamp"],
@@ -893,7 +1105,8 @@ def load_or_init_checkpoint(job: BackupJob, log_dir: Path) -> dict:
     if path.exists():
         try:
             # 파일이 비어있는지 체크
-            if path.stat().st_size == 0:
+            file_size = path.stat().st_size
+            if file_size == 0:
                 logger.warning(f"체크포인트 파일이 비어있습니다: {path}")
                 status = "incomplete"
                 processed = set()
@@ -902,24 +1115,46 @@ def load_or_init_checkpoint(job: BackupJob, log_dir: Path) -> dict:
             else:
                 with path.open("r", encoding="utf-8") as f:
                     data = json.load(f)
+                
+                # 데이터 검증
+                if not isinstance(data, dict):
+                    raise ValueError("체크포인트 데이터가 딕셔너리가 아닙니다")
+                
                 status = data.get("status", "incomplete")
                 if status == "incomplete":
-                    processed = set(data.get("processed_files", []))
-                    processed_dirs = set(data.get("processed_dirs", []))  # 완료된 디렉토리
-                    total_processed = data.get("total_processed", len(processed))  # 실제 처리된 전체 수
+                    processed_files = data.get("processed_files", [])
+                    if not isinstance(processed_files, list):
+                        raise ValueError("processed_files가 리스트가 아닙니다")
+                    processed = set(processed_files)
+                    
+                    processed_dirs_list = data.get("processed_dirs", [])
+                    if not isinstance(processed_dirs_list, list):
+                        raise ValueError("processed_dirs가 리스트가 아닙니다")
+                    processed_dirs = set(processed_dirs_list)
+                    
+                    total_processed = data.get("total_processed", len(processed))
+                    if not isinstance(total_processed, int):
+                        total_processed = len(processed)
                 else:
                     processed = set()
                     processed_dirs = set()
                     total_processed = 0
-        except (json.JSONDecodeError, ValueError) as e:
+        except (json.JSONDecodeError, ValueError, TypeError, KeyError) as e:
             logger.warning(f"체크포인트 파일 읽기 실패 (새로 시작): {path} - {e}")
             # 손상된 파일 백업
             try:
-                backup_path = path.with_suffix('.json.corrupt')
-                path.rename(backup_path)
+                timestamp = int(time.time())
+                backup_path = path.with_suffix(f'.json.corrupt.{timestamp}')
+                shutil.copy2(path, backup_path)
                 logger.info(f"손상된 체크포인트를 백업했습니다: {backup_path}")
-            except Exception:
-                pass
+            except Exception as backup_error:
+                logger.debug(f"손상된 체크포인트 백업 실패: {backup_error}")
+            status = "incomplete"
+            processed = set()
+            processed_dirs = set()
+            total_processed = 0
+        except (IOError, OSError, PermissionError) as e:
+            logger.error(f"체크포인트 파일 접근 실패: {path} - {e}")
             status = "incomplete"
             processed = set()
             processed_dirs = set()
@@ -944,6 +1179,7 @@ def load_or_init_checkpoint(job: BackupJob, log_dir: Path) -> dict:
 def save_checkpoint(cp: dict) -> None:
     """
     체크포인트 저장 (디렉토리 단위 추적 포함)
+    원자적 쓰기 적용
     """
     if cp is None:
         return
@@ -956,9 +1192,27 @@ def save_checkpoint(cp: dict) -> None:
         "last_updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "total_processed": cp.get("total_processed", len(cp["processed"])),  # 실제 처리된 전체 수
     }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # 원자적 쓰기: 임시 파일에 쓴 후 rename
+        tmp_path = path.with_suffix('.tmp')
+        with tmp_path.open("w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())  # 디스크에 확실히 쓰기
+        
+        # 원자적으로 교체
+        os.replace(tmp_path, path)
+    except Exception as e:
+        logger.error(f"체크포인트 저장 실패: {e}")
+        # 임시 파일 정리
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
 
 
 # ================ 진행률 계산용 =================
@@ -967,16 +1221,51 @@ def count_total_files_for_job(job: BackupJob) -> int:
     """
     진행률 계산을 위해 소스 아래 '대상 파일 수'를 미리 샘.
     exclude 패턴에 걸리는 파일은 제외.
+    심볼릭 링크, 특수 파일 제외.
     """
     total = 0
-    for root, dirs, files in os.walk(job.source):
-        root_path = Path(root)
-        dirs[:] = [d for d in dirs if not path_matches_patterns(root_path / d, job.exclude)]
-        for f in files:
-            p = root_path / f
-            if path_matches_patterns(p, job.exclude):
-                continue
-            total += 1
+    errors = 0
+    
+    try:
+        for root, dirs, files in os.walk(job.source, followlinks=False):
+            root_path = Path(root)
+            
+            # 제외 패턴에 맞는 디렉토리 필터링
+            filtered_dirs = []
+            for d in dirs:
+                try:
+                    dir_path = root_path / d
+                    if not path_matches_patterns(dir_path, job.exclude):
+                        # 심볼릭 링크 제외
+                        if not dir_path.is_symlink():
+                            filtered_dirs.append(d)
+                except (IOError, OSError, PermissionError):
+                    errors += 1
+                    continue
+            dirs[:] = filtered_dirs
+            
+            # 파일 카운트
+            for f in files:
+                try:
+                    p = root_path / f
+                    # 제외 패턴 체크
+                    if path_matches_patterns(p, job.exclude):
+                        continue
+                    # 심볼릭 링크 제외
+                    if p.is_symlink():
+                        continue
+                    # 일반 파일만 카운트
+                    if p.is_file():
+                        total += 1
+                except (IOError, OSError, PermissionError):
+                    errors += 1
+                    continue
+    except (IOError, OSError, PermissionError) as e:
+        logger.warning(f"파일 카운트 중 오류 발생: {e}")
+    
+    if errors > 0:
+        logger.warning(f"파일 카운트 중 {errors}개 항목 접근 실패 (권한 또는 I/O 오류)")
+    
     return total
 
 
@@ -987,41 +1276,74 @@ def rollback_journal(journal: Journal, dry_run: bool = False) -> None:
     Journal 을 역순으로 읽어 롤백 수행.
     """
     logger.info(f"=== 롤백 시작: job={journal.job_name}, ts={journal.timestamp} ===")
+    logger.info(f"총 {len(journal.ops)}개 작업을 롤백합니다.")
+    
+    success_count = 0
+    fail_count = 0
 
-    for op in reversed(journal.ops):
-        target = Path(op.target)
-        backup = Path(op.backup) if op.backup else None
+    for idx, op in enumerate(reversed(journal.ops), 1):
+        try:
+            target = Path(op.target)
+            backup = Path(op.backup) if op.backup else None
 
-        if op.action == "create_file":
-            if target.exists():
-                logger.info(f"[ROLLBACK delete created file] {target}")
-                if not dry_run:
-                    try:
-                        target.unlink()
-                    except Exception as e:
-                        logger.error(f"롤백: 파일 삭제 실패 {target}: {e}")
-
-        elif op.action in ("replace_file", "delete_file"):
-            if backup and backup.exists():
-                logger.info(f"[ROLLBACK restore] {backup} -> {target}")
-                if not dry_run:
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    try:
-                        if target.exists():
+            if op.action == "create_file":
+                if target.exists():
+                    logger.info(f"[{idx}/{len(journal.ops)}] [ROLLBACK delete created file] {target}")
+                    if not dry_run:
+                        try:
                             target.unlink()
-                        shutil.move(str(backup), str(target))
-                    except Exception as e:
-                        logger.error(f"롤백: 복원 실패 {backup} -> {target}: {e}")
+                            success_count += 1
+                        except (IOError, OSError, PermissionError) as e:
+                            logger.error(f"롤백: 파일 삭제 실패 {target}: {e}")
+                            fail_count += 1
+                else:
+                    logger.debug(f"[{idx}/{len(journal.ops)}] 대상 파일이 이미 없음: {target}")
+                    success_count += 1
 
-        elif op.action == "create_dir":
-            if target.exists() and target.is_dir():
-                try:
-                    target.rmdir()
-                    logger.info(f"[ROLLBACK rmdir] {target}")
-                except OSError:
-                    pass
+            elif op.action in ("replace_file", "delete_file"):
+                if backup and backup.exists():
+                    logger.info(f"[{idx}/{len(journal.ops)}] [ROLLBACK restore] {backup} -> {target}")
+                    if not dry_run:
+                        try:
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            if target.exists():
+                                target.unlink()
+                            shutil.move(str(backup), str(target))
+                            success_count += 1
+                        except (IOError, OSError, PermissionError) as e:
+                            logger.error(f"롤백: 복원 실패 {backup} -> {target}: {e}")
+                            fail_count += 1
+                elif backup:
+                    logger.warning(f"[{idx}/{len(journal.ops)}] 백업 파일 없음: {backup}")
+                    fail_count += 1
+                else:
+                    logger.debug(f"[{idx}/{len(journal.ops)}] 백업 없는 작업: {op.action}")
+                    success_count += 1
 
-    logger.info("=== 롤백 종료 ===")
+            elif op.action == "create_dir":
+                if target.exists() and target.is_dir():
+                    if not dry_run:
+                        try:
+                            target.rmdir()
+                            logger.info(f"[{idx}/{len(journal.ops)}] [ROLLBACK rmdir] {target}")
+                            success_count += 1
+                        except OSError as e:
+                            logger.debug(f"디렉토리 삭제 실패 (비어있지 않음?): {target} - {e}")
+                            # 비어있지 않은 디렉토리는 실패로 간주하지 않음
+                            success_count += 1
+                else:
+                    logger.debug(f"[{idx}/{len(journal.ops)}] 대상 디렉토리가 이미 없음: {target}")
+                    success_count += 1
+            else:
+                logger.warning(f"[{idx}/{len(journal.ops)}] 알 수 없는 작업 타입: {op.action}")
+                
+        except Exception as e:
+            logger.error(f"[{idx}/{len(journal.ops)}] 롤백 중 예외 발생: {e}")
+            fail_count += 1
+
+    logger.info("=" * 60)
+    logger.info(f"롤백 완료: 성공={success_count}, 실패={fail_count}, 전체={len(journal.ops)}")
+    logger.info("=" * 60)
 
 
 # ================ 핵심 백업 로직 (멀티스레드 복사) =================
@@ -1118,25 +1440,50 @@ def build_snapshot(job: BackupJob, journal: Journal, log_dir: Path) -> Path:
     snapshot_dir.mkdir(parents=True, exist_ok=True)
 
     files_manifest = []
+    errors = 0
 
-    for root, dirs, files in os.walk(dest_root):
+    for root, dirs, files in os.walk(dest_root, followlinks=False):
         root_path = Path(root)
+        
+        # 메타데이터 디렉토리 제외
         if any(x in root_path.parts for x in (".Rollback", ".SafetyNet", ".DiskSyncPro")):
             dirs[:] = []
             continue
 
         for f in files:
-            file_path = root_path / f
-            rel_path = file_path.relative_to(dest_root).as_posix()
-            st = file_path.stat()
-            entry = {
-                "path": rel_path,
-                "size": st.st_size,
-                "mtime": int(st.st_mtime),
-            }
-            if job.verify:
-                entry["hash"] = file_hash(file_path)
-            files_manifest.append(entry)
+            try:
+                file_path = root_path / f
+                
+                # 심볼릭 링크 제외
+                if file_path.is_symlink():
+                    continue
+                
+                # 일반 파일만 포함
+                if not file_path.is_file():
+                    continue
+                
+                rel_path = file_path.relative_to(dest_root).as_posix()
+                st = file_path.stat()
+                entry = {
+                    "path": rel_path,
+                    "size": st.st_size,
+                    "mtime": int(st.st_mtime),
+                }
+                if job.verify:
+                    try:
+                        entry["hash"] = file_hash(file_path)
+                    except Exception as e:
+                        logger.warning(f"해시 계산 실패 (스냅샷에서 제외): {file_path} - {e}")
+                        errors += 1
+                        continue
+                files_manifest.append(entry)
+            except (IOError, OSError, PermissionError) as e:
+                logger.warning(f"파일 정보 읽기 실패 (스냅샷에서 제외): {file_path} - {e}")
+                errors += 1
+                continue
+    
+    if errors > 0:
+        logger.warning(f"스냅샷 생성 중 {errors}개 파일 처리 실패")
 
     snapshot_data = {
         "job_name": job.name,
@@ -1253,6 +1600,52 @@ def write_summary(job: BackupJob, journal: Journal, stats: Stats, log_dir: Path)
 
 # ================ Backup 실행 (멀티스레드 + TUI) =================
 
+def check_disk_space(source: Path, destination: Path) -> tuple[bool, str]:
+    """
+    디스크 공간 체크
+    Returns: (충분한지 여부, 메시지)
+    """
+    try:
+        # 소스 크기 계산 (샘플링)
+        source_size = 0
+        sample_count = 0
+        max_samples = 1000  # 샘플링으로 빠르게 추정
+        
+        for root, dirs, files in os.walk(source):
+            for f in files:
+                if sample_count >= max_samples:
+                    break
+                try:
+                    p = Path(root) / f
+                    if p.is_file() and not p.is_symlink():
+                        source_size += p.stat().st_size
+                        sample_count += 1
+                except (IOError, OSError):
+                    continue
+            if sample_count >= max_samples:
+                break
+        
+        # 샘플링 기반 추정
+        if sample_count > 0:
+            estimated_total = source_size * 2  # 2배 여유
+        else:
+            estimated_total = 10 * 1024 * 1024 * 1024  # 10GB 기본값
+        
+        # 대상 디스크 여유 공간 확인
+        stat = os.statvfs(destination)
+        free_space = stat.f_bavail * stat.f_frsize
+        
+        if free_space < estimated_total:
+            gb_free = free_space / (1024**3)
+            gb_need = estimated_total / (1024**3)
+            return False, f"디스크 공간 부족: 필요={gb_need:.1f}GB, 여유={gb_free:.1f}GB"
+        
+        gb_free = free_space / (1024**3)
+        return True, f"디스크 여유 공간: {gb_free:.1f}GB"
+    except Exception as e:
+        return True, f"디스크 공간 체크 실패 (계속 진행): {e}"
+
+
 def perform_backup(job: BackupJob,
                    dry_run: bool,
                    log_dir: Path,
@@ -1270,13 +1663,28 @@ def perform_backup(job: BackupJob,
     if not job.source.exists():
         logger.error(f"소스 경로가 존재하지 않습니다: {job.source}")
         return
+    
+    if not job.source.is_dir():
+        logger.error(f"소스가 디렉토리가 아닙니다: {job.source}")
+        return
 
     if job.mode not in ("clone", "sync", "safety_net"):
         logger.error(f"지원하지 않는 모드입니다: {job.mode}")
         return
 
     if not dry_run:
-        job.destination.mkdir(parents=True, exist_ok=True)
+        try:
+            job.destination.mkdir(parents=True, exist_ok=True)
+        except (IOError, OSError, PermissionError) as e:
+            logger.error(f"대상 디렉토리 생성 실패: {e}")
+            return
+        
+        # 디스크 공간 체크
+        space_ok, space_msg = check_disk_space(job.source, job.destination)
+        logger.info(f"💾 {space_msg}")
+        if not space_ok:
+            logger.error("디스크 공간이 부족합니다. 백업을 중단합니다.")
+            return
 
     # 파일 개수 먼저 계산
     cancel_event = Event()
@@ -1470,8 +1878,18 @@ def perform_backup(job: BackupJob,
     def worker():
         """파일 복사 Worker 스레드"""
         while True:
-            if cancel_event.is_set() and task_queue.empty():
+            # 종료 신호 확인
+            if cancel_event.is_set():
+                # 큐에 남은 작업 빠르게 소진
+                try:
+                    while True:
+                        task_queue.get_nowait()
+                        task_queue.task_done()
+                except Empty:
+                    break
                 break
+            
+            # 작업 가져오기
             try:
                 src_file, dst_file, rel_path = task_queue.get(timeout=0.5)
             except Empty:
@@ -1480,6 +1898,12 @@ def perform_backup(job: BackupJob,
                 continue
 
             try:
+                # 취소 확인
+                if cancel_event.is_set():
+                    logger.debug(f"[CANCELLED] 스킵 (resume 시 재처리됨): {src_file}")
+                    continue
+                
+                # 동일 파일 체크
                 try:
                     if dst_file.exists() and is_same_file(src_file, dst_file):
                         with stats_lock:
@@ -1491,15 +1915,14 @@ def perform_backup(job: BackupJob,
                     logger.error(f"[ERROR] same file check 실패: {src_file} -> {dst_file}: {e}")
                     with stats_lock:
                         stats.copy_failed += 1
-                    # report_progress() 호출 안함 (실패한 파일은 카운트하지 않음)
                     continue
 
+                # 취소 재확인 (복사 전)
                 if cancel_event.is_set():
-                    logger.debug(f"[CANCELLED] 스킵 (resume 시 재처리됨): {src_file}")
-                    # 주의: checkpoint에 추가하지 않음 → resume 시 다시 처리됨
-                    # report_progress() 호출 안함 (실제 처리하지 않았으므로)
+                    logger.debug(f"[CANCELLED] 복사 전 스킵: {src_file}")
                     continue
 
+                # 복사 실행
                 ok = copy_with_retry(
                     src_file,
                     dst_file,
@@ -1524,7 +1947,7 @@ def perform_backup(job: BackupJob,
     logger.info(f"🔧 멀티스레드 Worker Pool 초기화: {num_threads}개 스레드")
     workers: List[Thread] = []
     for i in range(num_threads):
-        t = Thread(target=worker, daemon=True, name=f"Worker-{i+1}")
+        t = Thread(target=worker, daemon=False, name=f"Worker-{i+1}")  # daemon=False로 변경하여 명시적 종료
         t.start()
         workers.append(t)
     logger.info(f"✓ {num_threads}개 Worker 스레드 시작 완료")
@@ -1589,7 +2012,29 @@ def perform_backup(job: BackupJob,
                         break
 
                 src_file = root_path / file
+                
+                # 제외 패턴 체크
                 if path_matches_patterns(src_file, job.exclude):
+                    with stats_lock:
+                        stats.skipped_excluded += 1
+                    continue
+                
+                # 심볼릭 링크 제외
+                try:
+                    if src_file.is_symlink():
+                        logger.debug(f"[SKIP] 심볼릭 링크: {src_file}")
+                        with stats_lock:
+                            stats.skipped_excluded += 1
+                        continue
+                    
+                    # 일반 파일만 처리
+                    if not src_file.is_file():
+                        logger.debug(f"[SKIP] 일반 파일 아님: {src_file}")
+                        with stats_lock:
+                            stats.skipped_excluded += 1
+                        continue
+                except (IOError, OSError, PermissionError) as e:
+                    logger.warning(f"[SKIP] 파일 접근 실패: {src_file} - {e}")
                     with stats_lock:
                         stats.skipped_excluded += 1
                     continue
@@ -1823,6 +2268,21 @@ def perform_backup(job: BackupJob,
         logger.error("=" * 80)
         logger.error(f"[세션 종료 - 에러] {session_end_time}")
         logger.error("=" * 80)
+    finally:
+        # 스레드 정리 (항상 실행)
+        logger.info("워커 스레드 정리 중...")
+        cancel_event.set()  # 스레드에 종료 신호
+        
+        # 모든 워커 스레드가 종료될 때까지 대기 (최대 30초)
+        for t in workers:
+            try:
+                t.join(timeout=30)
+                if t.is_alive():
+                    logger.warning(f"스레드 {t.name} 종료 대기 시간 초과")
+            except Exception as e:
+                logger.error(f"스레드 정리 중 에러: {e}")
+        
+        logger.info(f"✓ 워커 스레드 정리 완료 ({len(workers)}개)")
 
 
 # ================ CLI (기존) =================
@@ -1945,10 +2405,32 @@ def main_rollback(args: argparse.Namespace) -> None:
 # ================ logs 기반 도우미 (메뉴에서 사용) =================
 
 def get_latest_journal(log_dir: Path) -> Optional[Path]:
-    journals = sorted(log_dir.glob("journal_*.json"))
+    """
+    최근 저널 파일 찾기 (새로운 디렉토리 구조 지원)
+    구조: logs/<config_name>/journals/journal_*.json
+    """
+    journals = []
+    
+    # 새 구조: logs/<config_name>/journals/
+    for config_dir in log_dir.iterdir():
+        if not config_dir.is_dir():
+            continue
+        journals_dir = config_dir / "journals"
+        if journals_dir.exists():
+            journals.extend(journals_dir.glob("journal_*.json"))
+    
+    # 구 구조: logs/journal_*.json (하위 호환성)
+    journals.extend(log_dir.glob("journal_*.json"))
+    
     if not journals:
         return None
-    return journals[-1]
+    
+    # 최신 파일 반환 (수정 시간 기준)
+    try:
+        return max(journals, key=lambda p: p.stat().st_mtime)
+    except (IOError, OSError):
+        # stat 실패 시 이름 기준 정렬
+        return sorted(journals)[-1]
 
 
 def safe_addstr(stdscr, row: int, col: int, text: str, attr=0):
@@ -2760,10 +3242,20 @@ def interactive_config_editor_curses(stdscr):
         }
         try:
             config_path.parent.mkdir(parents=True, exist_ok=True)
-            with config_path.open("w", encoding="utf-8") as f:
+            # 원자적 쓰기
+            tmp_path = config_path.with_suffix('.tmp')
+            with tmp_path.open("w", encoding="utf-8") as f:
                 json.dump(raw, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, config_path)
         except Exception as e:
             show_text_screen(stdscr, "오류", [f"config 저장 실패: {e}"])
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
             return
 
         show_text_screen(
@@ -3320,11 +3812,21 @@ def interactive_main_plain():
             }
             try:
                 config_path.parent.mkdir(parents=True, exist_ok=True)
-                with config_path.open("w", encoding="utf-8") as f:
+                # 원자적 쓰기
+                tmp_path = config_path.with_suffix('.tmp')
+                with tmp_path.open("w", encoding="utf-8") as f:
                     json.dump(raw, f, indent=2, ensure_ascii=False)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, config_path)
                 print(f"Config 저장 완료: {config_path}")
             except Exception as e:
                 print(f"Config 저장 실패: {e}")
+                try:
+                    if tmp_path.exists():
+                        tmp_path.unlink()
+                except Exception:
+                    pass
 
             input("계속하려면 Enter...")
 
