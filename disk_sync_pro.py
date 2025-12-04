@@ -49,6 +49,7 @@ import logging
 import os
 import shutil
 import sys
+import time
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
@@ -749,14 +750,35 @@ def load_or_init_checkpoint(job: BackupJob, log_dir: Path) -> dict:
     개선: 디렉토리 단위 체크포인트 추가
     """
     path = log_dir / f"checkpoint_{job.name}.json"
+    
     if path.exists():
-        with path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        status = data.get("status", "incomplete")
-        if status == "incomplete":
-            processed = set(data.get("processed_files", []))
-            processed_dirs = set(data.get("processed_dirs", []))  # 완료된 디렉토리
-        else:
+        try:
+            # 파일이 비어있는지 체크
+            if path.stat().st_size == 0:
+                logger.warning(f"체크포인트 파일이 비어있습니다: {path}")
+                status = "incomplete"
+                processed = set()
+                processed_dirs = set()
+            else:
+                with path.open("r", encoding="utf-8") as f:
+                    data = json.load(f)
+                status = data.get("status", "incomplete")
+                if status == "incomplete":
+                    processed = set(data.get("processed_files", []))
+                    processed_dirs = set(data.get("processed_dirs", []))  # 완료된 디렉토리
+                else:
+                    processed = set()
+                    processed_dirs = set()
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.warning(f"체크포인트 파일 읽기 실패 (새로 시작): {path} - {e}")
+            # 손상된 파일 백업
+            try:
+                backup_path = path.with_suffix('.json.corrupt')
+                path.rename(backup_path)
+                logger.info(f"손상된 체크포인트를 백업했습니다: {backup_path}")
+            except Exception:
+                pass
+            status = "incomplete"
             processed = set()
             processed_dirs = set()
     else:
@@ -1101,6 +1123,16 @@ def perform_backup(job: BackupJob,
     if not dry_run:
         job.destination.mkdir(parents=True, exist_ok=True)
 
+    # 파일 개수 먼저 계산
+    cancel_event = Event()
+    cancelled = False
+
+    total_files = count_total_files_for_job(job)
+    if total_files == 0:
+        logger.info("처리할 대상 파일이 없습니다. (0개)")
+    else:
+        logger.info(f"총 처리 대상 파일 수: {total_files:,}")
+
     # 멀티스레드 설정 (I/O bound 작업이므로 더 많은 스레드 사용)
     cpu_count = os.cpu_count() or 4
     if total_files > 100000:
@@ -1127,15 +1159,6 @@ def perform_backup(job: BackupJob,
         )
         tui.refresh_if_dirty()
 
-    cancel_event = Event()
-    cancelled = False
-
-    total_files = count_total_files_for_job(job)
-    if total_files == 0:
-        logger.info("처리할 대상 파일이 없습니다. (0개)")
-    else:
-        logger.info(f"총 처리 대상 파일 수: {total_files}")
-
     journal = prepare_journal(job)
     journal_file = journal_path_for(job, log_dir, journal.timestamp)
     logger.info(f"저널 파일: {journal_file}")
@@ -1146,15 +1169,31 @@ def perform_backup(job: BackupJob,
     cp = None
     already_processed = 0
     cp_lock = Lock()
-    if resume and not dry_run:
+    
+    if not dry_run:
+        # dry_run이 아닐 때만 checkpoint 사용
         cp = load_or_init_checkpoint(job, log_dir)
-        cp["status"] = "incomplete"
-        already_processed = len(cp["processed"])
+        
+        if resume:
+            # Resume 모드: 기존 checkpoint 활용
+            cp["status"] = "incomplete"
+            already_processed = len(cp["processed"])
+            logger.info(f"✓ Checkpoint 로드: {cp['path']}")
+            logger.info(f"   이미 처리된 파일: {already_processed:,}개")
+            logger.info(f"   완료된 디렉토리: {len(cp.get('processed_dirs', set())):,}개")
+        else:
+            # 새 백업: checkpoint 초기화
+            cp["processed"].clear()
+            cp["processed_dirs"].clear()
+            cp["status"] = "incomplete"
+            logger.info(f"✓ 새 Checkpoint 생성: {cp['path']}")
+        
+        # 초기 상태 저장
         save_checkpoint(cp)
-        if total_files > 0 and already_processed > 0:
+        
+        if resume and total_files > 0 and already_processed > 0:
             logger.info("=" * 60)
             logger.info(f"🔄 RESUME 모드 활성화")
-            logger.info(f"   이미 처리된 파일: {already_processed:,}개")
             logger.info(f"   처리할 파일: {total_files - already_processed:,}개")
             logger.info(f"   진행률: {int(already_processed * 100 / total_files)}%")
             logger.info("=" * 60)
@@ -1219,14 +1258,25 @@ def perform_backup(job: BackupJob,
                             f"[{speed:.1f} files/s]"
                         )
 
+    # Checkpoint 저장 최적화 (배치 처리)
+    checkpoint_save_counter = 0
+    checkpoint_save_interval = 100  # 100개마다 저장
+    
     def add_processed_file_safe(rel_path: str):
+        nonlocal checkpoint_save_counter
         if cp is None:
             return
         with cp_lock:
             if rel_path in cp["processed"]:
                 return
             cp["processed"].add(rel_path)
-            save_checkpoint(cp)
+            checkpoint_save_counter += 1
+            
+            # 100개마다 또는 중요한 시점에 저장
+            if checkpoint_save_counter >= checkpoint_save_interval:
+                save_checkpoint(cp)
+                checkpoint_save_counter = 0
+                logger.debug(f"[CHECKPOINT] 저장: {len(cp['processed']):,}개 처리 완료")
 
     # ============ AWS Step Function 스타일 Stage 관리 ============
     stages = {
@@ -1425,8 +1475,15 @@ def perform_backup(job: BackupJob,
 
         if not cancelled:
             task_queue.join()
+            
+            # 최종 checkpoint 저장
+            if cp is not None:
+                with cp_lock:
+                    save_checkpoint(cp)
+                    logger.info(f"[CHECKPOINT] 최종 저장: {len(cp['processed']):,}개 파일 처리 완료")
+            
             update_stage("STAGE_2_COPY", "completed", 
-                        items_processed=current_processed)
+                            items_processed=current_processed)
         else:
             logger.info("[CANCEL] 큐에 남은 작업은 스레드에서 정리 후 종료 예정")
             update_stage("STAGE_2_COPY", "failed", error="사용자 취소")
@@ -1438,9 +1495,11 @@ def perform_backup(job: BackupJob,
             update_stage("STAGE_4_SNAPSHOT", "failed", error="사용자 취소")
             journal.status = "cancelled"
             save_journal(journal, journal_file, destination_root=job.destination)
-            if cp is not None and not dry_run:
-                cp["status"] = "incomplete"
-                save_checkpoint(cp)
+            if cp is not None:
+                with cp_lock:
+                    cp["status"] = "incomplete"
+                    save_checkpoint(cp)
+                    logger.info(f"[CHECKPOINT] 취소 시점 저장: {len(cp['processed']):,}개 파일 처리 완료")
             logger.info(f"=== Job 취소됨: {job.name} (status=cancelled) ===")
             if tui is not None:
                 tui.update_progress(current_processed * 100 // (total_files or 1), current_processed, total_files)
@@ -1545,9 +1604,11 @@ def perform_backup(job: BackupJob,
         journal.status = "success"
         save_journal(journal, journal_file, destination_root=job.destination)
 
-        if cp is not None and not dry_run:
-            cp["status"] = "complete"
-            save_checkpoint(cp)
+        if cp is not None:
+            with cp_lock:
+                cp["status"] = "complete"
+                save_checkpoint(cp)
+                logger.info(f"[CHECKPOINT] 완료 상태 저장: {len(cp['processed']):,}개 파일")
 
         if not dry_run:
             snapshot_file = build_snapshot(job, journal, log_dir)
@@ -2107,17 +2168,58 @@ def interactive_select_job_curses(stdscr, config_path: Path) -> (Optional[str], 
         else:
             continue
 
+        # Dry-run 선택
         stdscr.clear()
-        safe_addstr(stdscr, 0, 0, "Dry-run 모드로 실행할까요? (변경 없이 시뮬레이션만 수행) [y/N]")
+        rows, cols = stdscr.getmaxyx()
+        safe_addstr(stdscr, 0, 0, "=" * cols)
+        safe_addstr(stdscr, 1, 0, " 옵션 선택 ".center(cols))
+        safe_addstr(stdscr, 2, 0, "=" * cols)
+        safe_addstr(stdscr, 4, 2, "Dry-run 모드로 실행할까요?")
+        safe_addstr(stdscr, 5, 2, "(변경 없이 시뮬레이션만 수행)")
+        safe_addstr(stdscr, 7, 2, "[Y] 예  [N] 아니오 (기본)")
         stdscr.refresh()
+        
+        # 키 버퍼 클리어
+        stdscr.nodelay(True)
+        while stdscr.getch() != -1:
+            pass
+        stdscr.nodelay(False)
+        
         ch = stdscr.getch()
         dry_run = (ch in (ord('y'), ord('Y')))
 
+        # Resume 선택
         stdscr.clear()
-        safe_addstr(stdscr, 0, 0, "이전 체크포인트(resume)를 사용할까요? [y/N]")
+        safe_addstr(stdscr, 0, 0, "=" * cols)
+        safe_addstr(stdscr, 1, 0, " 옵션 선택 ".center(cols))
+        safe_addstr(stdscr, 2, 0, "=" * cols)
+        safe_addstr(stdscr, 4, 2, "이전 체크포인트(Resume)를 사용할까요?")
+        safe_addstr(stdscr, 5, 2, "(중단된 지점부터 이어서 실행)")
+        safe_addstr(stdscr, 7, 2, "[Y] 예  [N] 아니오 (기본)")
         stdscr.refresh()
+        
+        # 키 버퍼 클리어
+        stdscr.nodelay(True)
+        while stdscr.getch() != -1:
+            pass
+        stdscr.nodelay(False)
+        
         ch = stdscr.getch()
         resume = (ch in (ord('y'), ord('Y')))
+        
+        # 선택 확인 화면
+        stdscr.clear()
+        safe_addstr(stdscr, 0, 0, "=" * cols)
+        safe_addstr(stdscr, 1, 0, " 선택 확인 ".center(cols))
+        safe_addstr(stdscr, 2, 0, "=" * cols)
+        safe_addstr(stdscr, 4, 2, f"Job: {job_name or '전체'}")
+        safe_addstr(stdscr, 5, 2, f"Dry-run: {'예' if dry_run else '아니오'}")
+        safe_addstr(stdscr, 6, 2, f"Resume: {'예' if resume else '아니오'}")
+        safe_addstr(stdscr, 8, 2, "백업을 시작합니다... (잠시만 기다려주세요)")
+        stdscr.refresh()
+        
+        # 1초 대기 (사용자가 확인할 수 있도록)
+        time.sleep(1)
 
         return job_name, dry_run, resume, False
 
@@ -2261,33 +2363,82 @@ def interactive_config_editor_curses(stdscr):
         return
 
 
-def interactive_backup_flow_curses(stdscr, base_log_dir: Path):
-    config_path = interactive_select_config_curses(stdscr)
-    if config_path is None:
-        return
+def interactive_backup_flow_curses(stdscr, base_log_dir: Path, auto_resume_config: dict = None):
+    """
+    백업 실행 플로우
+    auto_resume_config: 자동 Resume용 설정 (config_path, job_name)
+    """
+    try:
+        if auto_resume_config:
+            # 자동 Resume 모드
+            config_path = auto_resume_config["config_path"]
+            job_name = auto_resume_config["job_name"]
+            dry_run = False
+            resume = True
+            logger.info(f"🔄 자동 Resume 모드: {config_path.name} / {job_name or '전체'}")
+        else:
+            # 일반 모드
+            config_path = interactive_select_config_curses(stdscr)
+            if config_path is None:
+                return {"action": "menu"}  # 취소 시 메뉴로
 
-    job_name, dry_run, resume, cancelled = interactive_select_job_curses(stdscr, config_path)
-    if cancelled:
-        return
+            job_name, dry_run, resume, cancelled = interactive_select_job_curses(stdscr, config_path)
+            if cancelled:
+                return {"action": "menu"}  # 취소 시 메뉴로
 
-    args = SimpleNamespace(
-        command="backup",
-        config=str(config_path),
-        job=job_name,
-        dry_run=dry_run,
-        log_dir=str(base_log_dir),
-        resume=resume,
-    )
+        args = SimpleNamespace(
+            command="backup",
+            config=str(config_path),
+            job=job_name,
+            dry_run=dry_run,
+            log_dir=str(base_log_dir),
+            resume=resume,
+        )
 
-    tui = SimpleTUI(stdscr)
-    _run_backup(args, tui=tui)
-    tui.add_log_line("백업이 종료되었습니다. 아무 키나 누르면 메인 메뉴로 돌아갑니다.")
-    tui.refresh_if_dirty()
-    stdscr.nodelay(False)
-    stdscr.getch()
-    stdscr.nodelay(False)
-    stdscr.clear()
-    stdscr.refresh()
+        tui = SimpleTUI(stdscr)
+        _run_backup(args, tui=tui)
+        
+        # 백업 결과에 따른 처리
+        tui.add_log_line("=" * 60)
+        tui.add_log_line("백업이 종료되었습니다.")
+        tui.add_log_line("[R] Resume으로 재시작  [M] 메뉴로  [Q] 종료")
+        tui.add_log_line("=" * 60)
+        tui.refresh_if_dirty()
+        
+        # 키 버퍼 클리어
+        stdscr.nodelay(True)
+        while stdscr.getch() != -1:
+            pass
+        stdscr.nodelay(False)
+        
+        while True:
+            ch = stdscr.getch()
+            if ch in (ord('r'), ord('R')):
+                # Resume으로 재시작
+                stdscr.clear()
+                stdscr.refresh()
+                return {
+                    "action": "resume",
+                    "config_path": config_path,
+                    "job_name": job_name
+                }
+            elif ch in (ord('m'), ord('M')):
+                # 메뉴로
+                stdscr.clear()
+                stdscr.refresh()
+                return {"action": "menu"}
+            elif ch in (ord('q'), ord('Q')):
+                # 종료
+                return {"action": "quit"}
+            elif ch == 27:  # ESC
+                stdscr.clear()
+                stdscr.refresh()
+                return {"action": "menu"}
+    except Exception as e:
+        logger.error(f"백업 플로우 에러: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return {"action": "menu"}
 
 
 def interactive_latest_rollback_curses(stdscr, base_log_dir: Path):
@@ -2367,6 +2518,21 @@ def interactive_main_curses(stdscr):
         safe_addstr(stdscr, 1, (cols - len(version_line)) // 2, version_line)
 
         # 메뉴 옵션
+        # 최근 checkpoint 확인
+        latest_checkpoint = None
+        for cp_file in sorted(base_log_dir.glob("checkpoint_*.json"), reverse=True):
+            try:
+                with cp_file.open("r") as f:
+                    data = json.load(f)
+                    if data.get("status") == "incomplete":
+                        latest_checkpoint = {
+                            "name": data.get("job_name"),
+                            "processed": data.get("total_processed", 0)
+                        }
+                        break
+            except Exception:
+                pass
+        
         menu_lines = [
             ("", 0),
             ("메뉴를 선택하세요:", 0),
@@ -2376,9 +2542,17 @@ def interactive_main_curses(stdscr):
             ("3) journal_*.json 목록 보기", 2),
             ("4) snapshots/ 목록 보기", 2),
             ("5) config JSON 생성/수정", 2),
+        ]
+        
+        # Resume 가능한 Job이 있으면 표시
+        if latest_checkpoint:
+            menu_lines.insert(4, ("", 0))
+            menu_lines.insert(4, (f"   💾 Resume 가능: {latest_checkpoint['name']} ({latest_checkpoint['processed']:,}개 처리 완료)", 1))
+        
+        menu_lines.extend([
             ("", 0),
             ("Q) 종료", 2),
-        ]
+        ])
 
         row = 3
         for line, attr_type in menu_lines:
@@ -2407,9 +2581,38 @@ def interactive_main_curses(stdscr):
             break
         elif ch == ord('1'):
             try:
-                interactive_backup_flow_curses(stdscr, base_log_dir)
+                # 백업 실행 루프
+                auto_resume_cfg = None
+                
+                while True:
+                    result = interactive_backup_flow_curses(stdscr, base_log_dir, auto_resume_cfg)
+                    
+                    # 결과 없으면 메뉴로
+                    if not result:
+                        break
+                    
+                    action = result.get("action", "menu")
+                    
+                    if action == "resume":
+                        # Resume 설정 저장하고 다시 루프
+                        auto_resume_cfg = {
+                            "config_path": result["config_path"],
+                            "job_name": result["job_name"]
+                        }
+                        continue  # 루프 계속 - auto_resume_cfg로 재실행
+                    elif action == "quit":
+                        return  # 프로그램 종료
+                    else:
+                        # menu 또는 기타
+                        break
             except Exception as e:
-                show_text_screen(stdscr, "오류", [f"백업 실행 중 오류: {e}"])
+                import traceback
+                show_text_screen(stdscr, "오류", [
+                    f"백업 실행 중 오류: {e}",
+                    "",
+                    "상세:",
+                    traceback.format_exc()
+                ])
         elif ch == ord('2'):
             try:
                 interactive_latest_rollback_curses(stdscr, base_log_dir)
