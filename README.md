@@ -93,19 +93,19 @@ source venv/bin/activate
 ### 1) 시뮬레이션(Dry-run)
 
 ```bash
-python3 pro_smart_backup.py backup -c backup_config.json --dry-run
+python3 disk_sync_pro.py backup -c backup_config.json --dry-run
 ```
 
 ### 2) 실제 백업 실행
 
 ```bash
-python3 pro_smart_backup.py backup -c backup_config.json
+python3 disk_sync_pro.py backup -c backup_config.json
 ```
 
 특정 Job만 실행하고 싶다면:
 
 ```bash
-python3 pro_smart_backup.py backup -c backup_config.json -j ExtSSD1-to-ExtSSD2-SafetyNet
+python3 disk_sync_pro.py backup -c backup_config.json -j ExtSSD1-to-ExtSSD2-SafetyNet
 ```
 
 ---
@@ -116,13 +116,13 @@ python3 pro_smart_backup.py backup -c backup_config.json -j ExtSSD1-to-ExtSSD2-S
 원하면 특정 시점으로 수동으로 되돌릴 수도 있습니다.
 
 ```bash
-python3 pro_smart_backup.py rollback -f logs/journal_ExampleJob_20250101_120000.json
+python3 disk_sync_pro.py rollback -f logs/journal_ExampleJob_20250101_120000.json
 ```
 
 dry-run 롤백 시뮬레이션:
 
 ```bash
-python3 pro_smart_backup.py rollback -f journal.json --dry-run
+python3 disk_sync_pro.py rollback -f journal.json --dry-run
 ```
 
 ---
@@ -131,10 +131,10 @@ python3 pro_smart_backup.py rollback -f journal.json --dry-run
 
 ```
 SmartBackup/
- ├── pro_smart_backup.py
+ ├── disk_sync_pro.py
  ├── backup_config.json
  ├── logs/
- │    ├── pro_smart_backup_20250101.log
+ │    ├── disk_sync_pro_20250101.log
  │    └── journal_ExampleJob_20250101.json
  ├── .gitignore
  ├── README.md

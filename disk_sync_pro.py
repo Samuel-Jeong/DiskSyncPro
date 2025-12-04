@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-pro_smart_backup.py
+disk_sync_pro.py
 
 CCC + SuperDuper 스타일을 참고한, 비교적 안전한 디스크 백업/동기화 스크립트.
 
@@ -49,7 +49,7 @@ HASH_ALGO = "sha256"
 # ================ 로깅 설정 =================
 
 def setup_logger(log_file: Optional[Path] = None, verbose: bool = True) -> None:
-    logger = logging.getLogger("pro_smart_backup")
+    logger = logging.getLogger("disk_sync_pro")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
 
@@ -66,7 +66,7 @@ def setup_logger(log_file: Optional[Path] = None, verbose: bool = True) -> None:
         logger.addHandler(fh)
 
 
-logger = logging.getLogger("pro_smart_backup")
+logger = logging.getLogger("disk_sync_pro")
 
 
 # ================ 데이터 클래스 =================
@@ -114,21 +114,6 @@ class Journal:
 def load_config(config_path: Path) -> List[BackupJob]:
     """
     JSON 설정 파일을 읽어 BackupJob 리스트 생성
-
-    예시:
-    {
-      "jobs": [
-        {
-          "name": "Ext1-to-Ext2",
-          "source": "/Volumes/Ext1",
-          "destination": "/Volumes/Ext2/Backup_Ext1",
-          "mode": "safety_net",
-          "exclude": [".DS_Store", "*.tmp"],
-          "safety_net_days": 30,
-          "verify": false
-        }
-      ]
-    }
     """
     with config_path.open("r", encoding="utf-8") as f:
         raw = json.load(f)
@@ -302,7 +287,7 @@ def rollback_journal(journal: Journal, dry_run: bool = False) -> None:
     Journal 을 역순으로 읽어 롤백 수행.
     """
     logger.info(f"=== 롤백 시작: job={journal.job_name}, ts={journal.timestamp} ===")
-    dest_root = Path(journal.dest_root)
+    # dest_root = Path(journal.dest_root)  # 현재는 사용하지 않지만 유지
 
     # 가장 마지막 작업부터 되돌림
     for op in reversed(journal.ops):
@@ -348,26 +333,40 @@ def rollback_journal(journal: Journal, dry_run: bool = False) -> None:
 # ================ 핵심 백업 로직 =================
 
 def copy_with_retry(src: Path, dst: Path, verify: bool, journal: Journal,
-                    dry_run: bool = False) -> None:
+                    dry_run: bool = False) -> bool:
     """
     원자적 복사 + 재시도 + 해시 검증 + 저널 기록
+    실패 시 예외를 올리지 않고 False 를 반환해서
+    해당 파일만 스킵하도록 동작.
     """
     # dst 가 이미 존재하면 replace_file, 없으면 create_file
     action = "replace_file" if dst.exists() else "create_file"
     backup_path = None
 
     # 기존 파일 백업(rollback 용)
-    if action == "replace_file":
+    if action == "replace_file" and not dry_run:
         backup_path = Path(journal.rollback_root) / dst.relative_to(Path(journal.dest_root))
-        if not dry_run:
-            backup_path.parent.mkdir(parents=True, exist_ok=True)
-            logger.info(f"[BACKUP(before replace)] {dst} -> {backup_path}")
+        backup_path.parent.mkdir(parents=True, exist_ok=True)
+        logger.info(f"[BACKUP(before replace)] {dst} -> {backup_path}")
+        try:
             shutil.copy2(dst, backup_path)
+        except Exception as e:
+            logger.error(f"[BACKUP 실패] {dst} -> {backup_path}: {e}")
+            # 백업 실패해도, 일단 복사 시도는 진행할지 여부는 정책인데
+            # 여기서는 계속 진행하도록 함.
 
     # 실제 복사
     if dry_run:
         logger.info(f"[COPY (dry-run)] {src} -> {dst}")
+        # dry-run 은 항상 성공으로 간주
+        journal.ops.append(JournalOp(
+            action=action,
+            target=str(dst),
+            backup=str(backup_path) if backup_path else None
+        ))
+        return True
     else:
+        success = False
         for attempt in range(1, MAX_COPY_RETRY + 1):
             try:
                 logger.info(f"[COPY] {src} -> {dst} (attempt {attempt})")
@@ -377,15 +376,23 @@ def copy_with_retry(src: Path, dst: Path, verify: bool, journal: Journal,
                     dst_hash = file_hash(dst)
                     if src_hash != dst_hash:
                         raise IOError(f"해시 불일치: {src} != {dst}")
+                success = True
                 break
             except Exception as e:
                 logger.error(f"복사 실패 ({attempt}/{MAX_COPY_RETRY}): {src} -> {dst}: {e}")
-                if attempt == MAX_COPY_RETRY:
-                    raise
 
-    # 저널 기록
-    journal.ops.append(JournalOp(action=action, target=str(dst),
-                                 backup=str(backup_path) if backup_path else None))
+        if not success:
+            logger.error(f"[SKIP] 최대 재시도 실패로 이 파일은 스킵합니다: {src}")
+            # 실패했으므로 저널에 기록하지 않음 (롤백 대상 아님)
+            return False
+
+    # 성공 시에만 저널 기록
+    journal.ops.append(JournalOp(
+        action=action,
+        target=str(dst),
+        backup=str(backup_path) if backup_path else None
+    ))
+    return True
 
 
 def perform_backup(job: BackupJob, dry_run: bool, log_dir: Path) -> None:
@@ -438,12 +445,16 @@ def perform_backup(job: BackupJob, dry_run: bool, log_dir: Path) -> None:
                 if dst_file.exists() and is_same_file(src_file, dst_file):
                     continue
 
-                # safety_net 모드에서 덮어쓰기 전에 SafetyNet 이동 + rollback backup 은 별도로 관리할 수도 있지만
-                # 여기서는 rollback 을 최우선으로, SafetyNet 은 삭제/불필요 파일 쪽에 사용.
-                copy_with_retry(src_file, dst_file,
-                                verify=job.verify,
-                                journal=journal,
-                                dry_run=dry_run)
+                ok = copy_with_retry(
+                    src_file,
+                    dst_file,
+                    verify=job.verify,
+                    journal=journal,
+                    dry_run=dry_run,
+                )
+                if not ok:
+                    # 이 파일만 스킵하고 계속 진행
+                    continue
 
         # 2) clone/safety_net 모드에서, 소스에 없는 파일 정리
         if job.mode in ("clone", "safety_net"):
@@ -471,29 +482,35 @@ def perform_backup(job: BackupJob, dry_run: bool, log_dir: Path) -> None:
                     if not src_file.exists():
                         # 소스에 없는 파일: 삭제 or SafetyNet 이동
                         if job.mode == "clone":
-                            # rollback 을 위해 먼저 백업 영역으로 이동
                             backup_path = Path(journal.rollback_root) / dst_file.relative_to(job.destination)
                             if dry_run:
                                 logger.info(f"[DELETE (dry-run)] {dst_file}")
                             else:
-                                backup_path.parent.mkdir(parents=True, exist_ok=True)
-                                logger.info(f"[BACKUP(before delete)] {dst_file} -> {backup_path}")
-                                shutil.move(str(dst_file), str(backup_path))
+                                try:
+                                    backup_path.parent.mkdir(parents=True, exist_ok=True)
+                                    logger.info(f"[BACKUP(before delete)] {dst_file} -> {backup_path}")
+                                    shutil.move(str(dst_file), str(backup_path))
+                                    journal.ops.append(JournalOp(
+                                        action="delete_file",
+                                        target=str(dst_file),
+                                        backup=str(backup_path),
+                                    ))
+                                except Exception as e:
+                                    logger.error(f"[DELETE BACKUP 실패] {dst_file}: {e}")
+                                    # 삭제 실패해도 일단 계속 진행
+                        elif job.mode == "safety_net":
+                            try:
+                                sn_path = move_to_safety_net(dst_file, job.destination, dry_run=dry_run)
                                 journal.ops.append(JournalOp(
                                     action="delete_file",
                                     target=str(dst_file),
-                                    backup=str(backup_path),
+                                    backup=str(sn_path),
                                 ))
-                        elif job.mode == "safety_net":
-                            sn_path = move_to_safety_net(dst_file, job.destination, dry_run=dry_run)
-                            # SafetyNet 으로 옮긴 경로도 롤백에서 참고할 수 있도록 기록
-                            journal.ops.append(JournalOp(
-                                action="delete_file",
-                                target=str(dst_file),
-                                backup=str(sn_path),
-                            ))
+                            except Exception as e:
+                                logger.error(f"[SafetyNet 이동 실패] {dst_file}: {e}")
+                                # 실패 시에도 계속 진행
 
-            # clone 모드에서 비어있는 디렉토리 정리 (Rollback 에서는 create_dir 로 되돌릴 수 있음)
+            # clone 모드에서 비어있는 디렉토리 정리
             if job.mode == "clone" and not dry_run:
                 for root, dirs, _files in os.walk(job.destination, topdown=False):
                     root_path = Path(root)
@@ -567,7 +584,7 @@ def main_backup(args: argparse.Namespace) -> None:
 
     # 로그 파일
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = log_dir / f"pro_smart_backup_{ts}.log"
+    log_file = log_dir / f"disk_sync_pro_{ts}.log"
     setup_logger(log_file=log_file, verbose=True)
 
     logger.info(f"설정 파일: {config_path}")
@@ -595,7 +612,7 @@ def main_rollback(args: argparse.Namespace) -> None:
     # 롤백도 로그 남김
     log_dir = journal_path.parent
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = log_dir / f"pro_smart_backup_rollback_{ts}.log"
+    log_file = log_dir / f"disk_sync_pro_rollback_{ts}.log"
     setup_logger(log_file=log_file, verbose=True)
 
     logger.info(f"저널 파일: {journal_path}")

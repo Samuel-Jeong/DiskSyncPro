@@ -1,0 +1,19 @@
+{
+  "jobs": [
+    {
+      "name": "WORK-to-WORK_BACKUP",
+      "source": "/Volumes/WORK",
+      "destination": "/Volumes/WORK_BACKUP/WORK_20251204",
+      "mode": "safety_net",
+      "exclude": [
+        ".DS_Store",
+        ".Spotlight-V100",
+        ".fseventsd",
+        "node_modules",
+        "*.tmp"
+      ],
+      "safety_net_days": 30,
+      "verify": false
+    }
+  ]
+}
