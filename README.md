@@ -57,4 +57,4 @@ Carbon Copy Cloner·SuperDuper처럼 **스냅샷 느낌의 안전 복사 + Smart
 
 ```bash
 git clone <your-repo-url>
-cd SmartBackup
+cd DiskSyncPro
