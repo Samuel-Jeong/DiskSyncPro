@@ -50,6 +50,8 @@ import os
 import shutil
 import sys
 import time
+import atexit
+import fcntl
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
@@ -93,9 +95,9 @@ def setup_logger(log_file: Optional[Path] = None,
         ch.setFormatter(fmt)
         logger.addHandler(ch)
 
-    # 파일 로그 핸들러
+    # 파일 로그 핸들러 (append 모드)
     if log_file:
-        fh = logging.FileHandler(log_file, encoding="utf-8")
+        fh = logging.FileHandler(log_file, mode='a', encoding="utf-8")
         fh.setFormatter(fmt)
         logger.addHandler(fh)
 
@@ -109,6 +111,125 @@ def setup_logger(log_file: Optional[Path] = None,
 logger = logging.getLogger("disk_sync_pro")
 
 
+# ================ 로그 파일 관리 =================
+
+def cleanup_old_logs(log_dir: Path, keep_days: int = 30):
+    """
+    오래된 로그 파일 정리
+    Args:
+        log_dir: 로그 디렉토리
+        keep_days: 보관 일수 (기본 30일)
+    """
+    try:
+        if not log_dir.exists():
+            return
+        
+        from datetime import timedelta
+        cutoff_date = datetime.now() - timedelta(days=keep_days)
+        
+        deleted_count = 0
+        for log_file in log_dir.glob("disk_sync_pro_*.log"):
+            try:
+                # 파일 수정 시간 확인
+                mtime = datetime.fromtimestamp(log_file.stat().st_mtime)
+                
+                if mtime < cutoff_date:
+                    log_file.unlink()
+                    deleted_count += 1
+            except Exception:
+                continue
+        
+        if deleted_count > 0:
+            logger.info(f"오래된 로그 파일 {deleted_count}개 삭제 (보관기간: {keep_days}일)")
+    except Exception as e:
+        logger.warning(f"로그 파일 정리 실패: {e}")
+
+
+# ================ 프로그램 중복 실행 방지 =================
+
+class SingleInstanceLock:
+    """
+    fcntl을 사용한 프로그램 중복 실행 방지
+    """
+    def __init__(self, lock_file: Path):
+        self.lock_file = lock_file
+        self.pid_file = lock_file.with_suffix('.pid')  # 별도 PID 파일
+        self.lock_fd = None
+    
+    def acquire(self) -> bool:
+        """
+        Lock 획득 시도
+        Returns:
+            True: Lock 획득 성공 (프로그램 실행 가능)
+            False: Lock 획득 실패 (이미 실행 중)
+        """
+        try:
+            # Lock 파일 생성 (디렉토리가 없으면 생성)
+            self.lock_file.parent.mkdir(parents=True, exist_ok=True)
+            
+            # 파일 열기 (O_CREAT | O_RDWR)
+            self.lock_fd = open(self.lock_file, 'w')
+            
+            # Non-blocking lock 시도
+            fcntl.flock(self.lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            
+            # Lock 파일에 PID 기록 (flush 필수)
+            self.lock_fd.write(f"{os.getpid()}\n")
+            self.lock_fd.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            self.lock_fd.flush()
+            
+            # 별도 PID 파일에도 기록 (다른 프로세스가 쉽게 읽을 수 있도록)
+            try:
+                with open(self.pid_file, 'w') as pf:
+                    pf.write(f"{os.getpid()}\n")
+                    pf.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            except Exception:
+                pass  # PID 파일 실패해도 lock은 성공
+            
+            # 프로그램 종료 시 자동으로 lock 해제
+            atexit.register(self.release)
+            
+            return True
+        except (IOError, OSError) as e:
+            if self.lock_fd:
+                self.lock_fd.close()
+                self.lock_fd = None
+            return False
+    
+    def release(self):
+        """Lock 해제"""
+        if self.lock_fd:
+            try:
+                fcntl.flock(self.lock_fd.fileno(), fcntl.LOCK_UN)
+                self.lock_fd.close()
+            except Exception:
+                pass
+            finally:
+                self.lock_fd = None
+            
+            # Lock 파일 삭제
+            try:
+                if self.lock_file.exists():
+                    self.lock_file.unlink()
+            except Exception:
+                pass
+            
+            # PID 파일 삭제
+            try:
+                if self.pid_file.exists():
+                    self.pid_file.unlink()
+            except Exception:
+                pass
+    
+    def __enter__(self):
+        if not self.acquire():
+            raise RuntimeError("프로그램이 이미 실행 중입니다")
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.release()
+
+
 # ================ 데이터 클래스 =================
 
 @dataclass
@@ -120,6 +241,7 @@ class BackupJob:
     exclude: List[str]
     safety_net_days: int = 30
     verify: bool = False
+    config_name: str = "default"  # config 파일명 (그룹핑용)
 
 
 @dataclass
@@ -556,6 +678,9 @@ def load_config(config_path: Path) -> List[BackupJob]:
     with config_path.open("r", encoding="utf-8") as f:
         raw = json.load(f)
 
+    # config 파일명을 그룹 이름으로 사용 (확장자 제외)
+    config_name = config_path.stem  # 예: "backup_config" from "backup_config.json"
+    
     jobs: List[BackupJob] = []
     for job in raw.get("jobs", []):
         jobs.append(
@@ -567,6 +692,7 @@ def load_config(config_path: Path) -> List[BackupJob]:
                 exclude=job.get("exclude", []),
                 safety_net_days=job.get("safety_net_days", 30),
                 verify=job.get("verify", False),
+                config_name=config_name,  # config 이름 추가
             )
         )
     return jobs
@@ -690,7 +816,14 @@ def prepare_journal(job: BackupJob) -> Journal:
 
 
 def journal_path_for(job: BackupJob, log_dir: Path, ts: str) -> Path:
-    return log_dir / f"journal_{job.name}_{ts}.json"
+    """
+    Journal 파일 경로 생성
+    구조: logs/<config_name>/journals/journal_<job_name>_<timestamp>.json
+    """
+    config_dir = log_dir / job.config_name
+    journals_dir = config_dir / "journals"
+    journals_dir.mkdir(parents=True, exist_ok=True)
+    return journals_dir / f"journal_{job.name}_{ts}.json"
 
 
 def get_dest_meta_dir(destination_root: Path) -> Path:
@@ -748,8 +881,14 @@ def load_or_init_checkpoint(job: BackupJob, log_dir: Path) -> dict:
     status != 'incomplete' 인 경우 processed 는 초기화.
     
     개선: 디렉토리 단위 체크포인트 추가
+    구조: logs/<config_name>/checkpoints/checkpoint_<job_name>.json
     """
-    path = log_dir / f"checkpoint_{job.name}.json"
+    # config별로 디렉토리 구성
+    config_dir = log_dir / job.config_name
+    checkpoint_dir = config_dir / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    
+    path = checkpoint_dir / f"checkpoint_{job.name}.json"
     
     if path.exists():
         try:
@@ -759,6 +898,7 @@ def load_or_init_checkpoint(job: BackupJob, log_dir: Path) -> dict:
                 status = "incomplete"
                 processed = set()
                 processed_dirs = set()
+                total_processed = 0
             else:
                 with path.open("r", encoding="utf-8") as f:
                     data = json.load(f)
@@ -766,9 +906,11 @@ def load_or_init_checkpoint(job: BackupJob, log_dir: Path) -> dict:
                 if status == "incomplete":
                     processed = set(data.get("processed_files", []))
                     processed_dirs = set(data.get("processed_dirs", []))  # 완료된 디렉토리
+                    total_processed = data.get("total_processed", len(processed))  # 실제 처리된 전체 수
                 else:
                     processed = set()
                     processed_dirs = set()
+                    total_processed = 0
         except (json.JSONDecodeError, ValueError) as e:
             logger.warning(f"체크포인트 파일 읽기 실패 (새로 시작): {path} - {e}")
             # 손상된 파일 백업
@@ -781,16 +923,19 @@ def load_or_init_checkpoint(job: BackupJob, log_dir: Path) -> dict:
             status = "incomplete"
             processed = set()
             processed_dirs = set()
+            total_processed = 0
     else:
         status = "incomplete"
         processed = set()
         processed_dirs = set()
+        total_processed = 0
     
     cp = {
         "job_name": job.name,
         "status": status,
         "processed": processed,
         "processed_dirs": processed_dirs,  # 디렉토리 단위 추적
+        "total_processed": total_processed,  # 실제 처리된 전체 수
         "path": path,
     }
     return cp
@@ -809,7 +954,7 @@ def save_checkpoint(cp: dict) -> None:
         "processed_files": sorted(list(cp["processed"]))[:1000],  # 최근 1000개만 저장 (메모리 절약)
         "processed_dirs": sorted(list(cp.get("processed_dirs", set()))),  # 완료된 디렉토리
         "last_updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "total_processed": len(cp["processed"]),  # 전체 처리 수
+        "total_processed": cp.get("total_processed", len(cp["processed"])),  # 실제 처리된 전체 수
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
@@ -963,9 +1108,13 @@ def build_snapshot(job: BackupJob, journal: Journal, log_dir: Path) -> Path:
     """
     백업 완료 후 destination 전체 스냅샷(manifest) 생성.
     logs 폴더와 타겟 폴더 모두에 저장.
+    구조: logs/<config_name>/snapshots/<job_name>/
     """
     dest_root = job.destination
-    snapshot_dir = log_dir / "snapshots" / job.name
+    
+    # config별로 디렉토리 구성
+    config_dir = log_dir / job.config_name
+    snapshot_dir = config_dir / "snapshots" / job.name
     snapshot_dir.mkdir(parents=True, exist_ok=True)
 
     files_manifest = []
@@ -1061,7 +1210,13 @@ def write_summary(job: BackupJob, journal: Journal, stats: Stats, log_dir: Path)
     """
     변경 요약 리포트 JSON 생성.
     logs 폴더와 타겟 폴더 모두에 저장.
+    구조: logs/<config_name>/summaries/summary_<job_name>_<timestamp>.json
     """
+    # config별로 디렉토리 구성
+    config_dir = log_dir / job.config_name
+    summaries_dir = config_dir / "summaries"
+    summaries_dir.mkdir(parents=True, exist_ok=True)
+    
     summary = {
         "job_name": job.name,
         "timestamp": journal.timestamp,
@@ -1072,8 +1227,8 @@ def write_summary(job: BackupJob, journal: Journal, stats: Stats, log_dir: Path)
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
-    # logs 폴더에 저장
-    summary_file = log_dir / f"summary_{job.name}_{journal.timestamp}.json"
+    # logs/<config_name>/summaries/ 폴더에 저장
+    summary_file = summaries_dir / f"summary_{job.name}_{journal.timestamp}.json"
     with summary_file.open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
 
@@ -1177,14 +1332,16 @@ def perform_backup(job: BackupJob,
         if resume:
             # Resume 모드: 기존 checkpoint 활용
             cp["status"] = "incomplete"
-            already_processed = len(cp["processed"])
+            already_processed = cp.get("total_processed", len(cp["processed"]))
             logger.info(f"✓ Checkpoint 로드: {cp['path']}")
-            logger.info(f"   이미 처리된 파일: {already_processed:,}개")
+            logger.info(f"   이미 처리된 파일: {already_processed:,}개 (실제)")
+            logger.info(f"   checkpoint 파일 수: {len(cp['processed']):,}개 (최근)")
             logger.info(f"   완료된 디렉토리: {len(cp.get('processed_dirs', set())):,}개")
         else:
             # 새 백업: checkpoint 초기화
             cp["processed"].clear()
             cp["processed_dirs"].clear()
+            cp["total_processed"] = 0
             cp["status"] = "incomplete"
             logger.info(f"✓ 새 Checkpoint 생성: {cp['path']}")
         
@@ -1270,13 +1427,14 @@ def perform_backup(job: BackupJob,
             if rel_path in cp["processed"]:
                 return
             cp["processed"].add(rel_path)
+            cp["total_processed"] = cp.get("total_processed", 0) + 1  # 실제 처리 수 증가
             checkpoint_save_counter += 1
             
             # 100개마다 또는 중요한 시점에 저장
             if checkpoint_save_counter >= checkpoint_save_interval:
                 save_checkpoint(cp)
                 checkpoint_save_counter = 0
-                logger.debug(f"[CHECKPOINT] 저장: {len(cp['processed']):,}개 처리 완료")
+                logger.debug(f"[CHECKPOINT] 저장: {cp['total_processed']:,}개 처리 완료")
 
     # ============ AWS Step Function 스타일 Stage 관리 ============
     stages = {
@@ -1333,13 +1491,13 @@ def perform_backup(job: BackupJob,
                     logger.error(f"[ERROR] same file check 실패: {src_file} -> {dst_file}: {e}")
                     with stats_lock:
                         stats.copy_failed += 1
-                    report_progress()
+                    # report_progress() 호출 안함 (실패한 파일은 카운트하지 않음)
                     continue
 
                 if cancel_event.is_set():
-                    logger.info(f"[CANCELLED] 스킵 (resume 시 재처리됨): {src_file}")
+                    logger.debug(f"[CANCELLED] 스킵 (resume 시 재처리됨): {src_file}")
                     # 주의: checkpoint에 추가하지 않음 → resume 시 다시 처리됨
-                    report_progress()
+                    # report_progress() 호출 안함 (실제 처리하지 않았으므로)
                     continue
 
                 ok = copy_with_retry(
@@ -1480,7 +1638,7 @@ def perform_backup(job: BackupJob,
             if cp is not None:
                 with cp_lock:
                     save_checkpoint(cp)
-                    logger.info(f"[CHECKPOINT] 최종 저장: {len(cp['processed']):,}개 파일 처리 완료")
+                    logger.info(f"[CHECKPOINT] 최종 저장: {cp.get('total_processed', 0):,}개 파일 처리 완료")
             
             update_stage("STAGE_2_COPY", "completed", 
                             items_processed=current_processed)
@@ -1499,8 +1657,15 @@ def perform_backup(job: BackupJob,
                 with cp_lock:
                     cp["status"] = "incomplete"
                     save_checkpoint(cp)
-                    logger.info(f"[CHECKPOINT] 취소 시점 저장: {len(cp['processed']):,}개 파일 처리 완료")
+                    logger.info(f"[CHECKPOINT] 취소 시점 저장: {cp.get('total_processed', 0):,}개 파일 처리 완료")
             logger.info(f"=== Job 취소됨: {job.name} (status=cancelled) ===")
+            
+            # 세션 종료 로그
+            session_end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            logger.info("=" * 80)
+            logger.info(f"[세션 종료 - 취소] {session_end_time}")
+            logger.info("=" * 80)
+            
             if tui is not None:
                 tui.update_progress(current_processed * 100 // (total_files or 1), current_processed, total_files)
                 tui.refresh_if_dirty()
@@ -1608,7 +1773,7 @@ def perform_backup(job: BackupJob,
             with cp_lock:
                 cp["status"] = "complete"
                 save_checkpoint(cp)
-                logger.info(f"[CHECKPOINT] 완료 상태 저장: {len(cp['processed']):,}개 파일")
+                logger.info(f"[CHECKPOINT] 완료 상태 저장: {cp.get('total_processed', 0):,}개 파일")
 
         if not dry_run:
             snapshot_file = build_snapshot(job, journal, log_dir)
@@ -1629,6 +1794,12 @@ def perform_backup(job: BackupJob,
         logger.info("=" * 60)
 
         logger.info(f"=== Job 성공: {job.name} ===")
+        
+        # 세션 종료 로그
+        session_end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        logger.info("=" * 80)
+        logger.info(f"[세션 종료] {session_end_time}")
+        logger.info("=" * 80)
 
         if tui is not None:
             tui.refresh_if_dirty()
@@ -1646,6 +1817,12 @@ def perform_backup(job: BackupJob,
         finally:
             save_journal(journal, journal_file, destination_root=job.destination)
         logger.error(f"=== Job 실패 및 롤백 처리 완료 (status={journal.status}) ===")
+        
+        # 세션 종료 로그
+        session_end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        logger.error("=" * 80)
+        logger.error(f"[세션 종료 - 에러] {session_end_time}")
+        logger.error("=" * 80)
 
 
 # ================ CLI (기존) =================
@@ -1683,12 +1860,21 @@ def _run_backup(args: argparse.Namespace, tui: Optional[SimpleTUI] = None) -> Pa
         log_dir = Path(__file__).resolve().parent / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = log_dir / f"disk_sync_pro_{ts}.log"
+    # 날짜별로 로그 파일 생성 (append 모드)
+    date_str = datetime.now().strftime("%Y%m%d")
+    log_file = log_dir / f"disk_sync_pro_{date_str}.log"
 
     use_tui = tui is not None
     setup_logger(log_file=log_file, verbose=not use_tui, use_tui=use_tui, tui_obj=tui)
 
+    # 오래된 로그 파일 정리 (30일 이상)
+    cleanup_old_logs(log_dir, keep_days=30)
+
+    # 세션 시작 구분자
+    session_start_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    logger.info("=" * 80)
+    logger.info(f"[세션 시작] {session_start_time}")
+    logger.info("=" * 80)
     logger.info(f"설정 파일: {config_path}")
     logger.info(f"로그 파일: {log_file}")
 
@@ -1727,10 +1913,17 @@ def main_rollback(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     log_dir = journal_path.parent
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = log_dir / f"disk_sync_pro_rollback_{ts}.log"
+    
+    # 날짜별로 rollback 로그 파일 생성 (append 모드)
+    date_str = datetime.now().strftime("%Y%m%d")
+    log_file = log_dir / f"disk_sync_pro_rollback_{date_str}.log"
     setup_logger(log_file=log_file, verbose=True)
 
+    # 세션 시작 구분자
+    session_start_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    logger.info("=" * 80)
+    logger.info(f"[ROLLBACK 세션 시작] {session_start_time}")
+    logger.info("=" * 80)
     logger.info(f"저널 파일: {journal_path}")
     journal = load_journal(journal_path)
     logger.info(f"Journal status: {journal.status}")
@@ -1807,53 +2000,276 @@ def show_text_screen(stdscr, title: str, lines: List[str]):
 
 def show_journal_list_screen(stdscr, log_dir: Path):
     lines: List[str] = []
-    journals = sorted(log_dir.glob("journal_*.json"))
+    
+    # config별로 디렉토리 구조 탐색
+    journals = []
+    for config_dir in sorted(log_dir.iterdir()):
+        if not config_dir.is_dir():
+            continue
+        journals_dir = config_dir / "journals"
+        if journals_dir.exists():
+            journals.extend(journals_dir.glob("journal_*.json"))
+    
+    journals = sorted(journals)
+    
     if not journals:
-        lines.append("journal_*.json 파일이 없습니다.")
-    else:
-        for j in journals[-100:]:
+        lines.append("")
+        lines.append("   ⚠️  journal 파일이 없습니다.")
+        lines.append("")
+        lines.append("   백업을 실행하면 journal이 생성됩니다.")
+        show_text_screen(stdscr, "📋 Journal 목록", lines)
+        return
+    
+    # Job별로 그룹화
+    journals_by_job = {}
+    for j in journals:
+        try:
+            data = load_journal(j)
+            job_name = data.job_name
+            if job_name not in journals_by_job:
+                journals_by_job[job_name] = []
+            
+            # 파일 크기
+            file_size = j.stat().st_size
+            if file_size > 1024 * 1024:
+                size_str = f"{file_size / (1024 * 1024):.1f} MB"
+            elif file_size > 1024:
+                size_str = f"{file_size / 1024:.1f} KB"
+            else:
+                size_str = f"{file_size} B"
+            
+            journals_by_job[job_name].append({
+                'file': j,
+                'data': data,
+                'size': size_str,
+                'ops_count': len(data.ops)
+            })
+        except Exception as e:
+            # 읽기 실패한 경우
+            if 'ERROR' not in journals_by_job:
+                journals_by_job['ERROR'] = []
+            journals_by_job['ERROR'].append({
+                'file': j,
+                'error': str(e)
+            })
+    
+    # 전체 통계
+    total_journals = len(journals)
+    total_jobs = len([k for k in journals_by_job.keys() if k != 'ERROR'])
+    
+    lines.append("")
+    lines.append(f"  📊 전체 통계: {total_jobs}개 Job, 총 {total_journals:,}개 Journal")
+    lines.append(f"  {'─' * 78}")
+    
+    # Job별로 표시
+    for job_name in sorted(journals_by_job.keys()):
+        job_journals = journals_by_job[job_name]
+        
+        if job_name == 'ERROR':
+            # 에러 섹션
+            lines.append("")
+            lines.append(f"╭{'─' * 78}╮")
+            lines.append(f"│ ❌ 읽기 실패{' ' * 64}│")
+            lines.append(f"├{'─' * 78}┤")
+            
+            for item in job_journals:
+                filename = item['file'].name
+                error = item['error']
+                if len(filename) > 60:
+                    filename = filename[:57] + "..."
+                if len(error) > 60:
+                    error = error[:57] + "..."
+                lines.append(f"│   {filename:<70}│")
+                lines.append(f"│   └─ {error:<68}│")
+            
+            lines.append(f"╰{'─' * 78}╯")
+            continue
+        
+        # 정상 Job
+        lines.append("")
+        lines.append(f"╭{'─' * 78}╮")
+        lines.append(f"│ 📦 Job: {job_name:<68} │")
+        lines.append(f"├{'─' * 78}┤")
+        lines.append(f"│   총 Journal: {len(job_journals):,}개{' ' * (63 - len(f'{len(job_journals):,}'))}│")
+        lines.append(f"├{'─' * 78}┤")
+        
+        # 최근 10개만 표시
+        recent_journals = sorted(job_journals, key=lambda x: x['file'].name)[-10:]
+        
+        for idx, item in enumerate(recent_journals, 1):
+            data = item['data']
+            size_str = item['size']
+            ops_count = item['ops_count']
+            
+            # 날짜/시간 파싱
             try:
-                data = load_journal(j)
-                lines.append(
-                    f"{j.name}  | job={data.job_name} | ts={data.timestamp} | status={data.status}"
-                )
-            except Exception as e:
-                lines.append(f"{j.name}  | (읽기 실패: {e})")
-
-    show_text_screen(stdscr, "Journal 목록", lines)
+                # timestamp: WORK-to-WORK_BACKUP_20251205_141530
+                parts = data.timestamp.split('_')
+                if len(parts) >= 3:
+                    date_part = parts[-2]  # 20251205
+                    time_part = parts[-1]  # 141530
+                    formatted_date = f"{date_part[:4]}-{date_part[4:6]}-{date_part[6:8]}"
+                    formatted_time = f"{time_part[:2]}:{time_part[2:4]}:{time_part[4:6]}"
+                    display_datetime = f"{formatted_date} {formatted_time}"
+                else:
+                    display_datetime = data.timestamp
+            except:
+                display_datetime = data.timestamp[:30]
+            
+            # Status 이모지
+            if data.status == "complete":
+                status_icon = "✅"
+            elif data.status == "cancelled":
+                status_icon = "⚠️"
+            else:
+                status_icon = "❌"
+            
+            lines.append(f"│                                                                              │")
+            lines.append(f"│   [{idx:2d}] 📅 {display_datetime:<30} {status_icon}               │")
+            lines.append(f"│        📝 작업: {ops_count:,}개 / 크기: {size_str:<10}{' ' * (41 - len(f'{ops_count:,}') - len(size_str))}│")
+            lines.append(f"│        📊 상태: {data.status:<62}│")
+        
+        # 더 많은 journal이 있는 경우
+        if len(job_journals) > 10:
+            remaining = len(job_journals) - 10
+            lines.append(f"│                                                                              │")
+            lines.append(f"│   ... 외 {remaining:,}개의 이전 Journal{' ' * (52 - len(f'{remaining:,}'))}│")
+        
+        lines.append(f"╰{'─' * 78}╯")
+    
+    show_text_screen(stdscr, "📋 Journal 목록", lines)
 
 
 def show_snapshot_list_screen(stdscr, log_dir: Path):
     lines: List[str] = []
-    snapshots_root = log_dir / "snapshots"
-    if not snapshots_root.exists():
-        lines.append("snapshots 디렉토리가 없습니다.")
-        show_text_screen(stdscr, "Snapshot 목록", lines)
+    
+    # config별로 디렉토리 구조 탐색
+    config_snapshot_map = {}  # {config_name: [job_dirs]}
+    
+    for config_dir in sorted(log_dir.iterdir()):
+        if not config_dir.is_dir():
+            continue
+        snapshots_root = config_dir / "snapshots"
+        if snapshots_root.exists():
+            job_dirs = sorted([d for d in snapshots_root.iterdir() if d.is_dir()])
+            if job_dirs:
+                config_snapshot_map[config_dir.name] = job_dirs
+    
+    if not config_snapshot_map:
+        lines.append("")
+        lines.append("   ⚠️  snapshots 디렉토리가 없습니다.")
+        lines.append("")
+        lines.append("   스냅샷은 백업 완료 시 자동으로 생성됩니다.")
+        show_text_screen(stdscr, "📸 Snapshot 목록", lines)
         return
-
-    for job_dir in sorted(snapshots_root.iterdir()):
-        if not job_dir.is_dir():
-            continue
-        index_file = job_dir / "index.json"
-        if not index_file.exists():
-            lines.append(f"[{job_dir.name}] index.json 없음")
-            continue
-        try:
-            with index_file.open("r", encoding="utf-8") as f:
-                index = json.load(f)
-            lines.append(f"=== Job: {job_dir.name} (snapshots: {len(index)}) ===")
-            for entry in index[-20:]:
-                lines.append(
-                    f"  ts={entry.get('timestamp')} | file={entry.get('snapshot_file')} "
-                    f"| count={entry.get('file_count')} | at={entry.get('generated_at')}"
-                )
-        except Exception as e:
-            lines.append(f"[{job_dir.name}] index.json 읽기 실패: {e}")
-
-    if not lines:
-        lines.append("표시할 스냅샷이 없습니다.")
-
-    show_text_screen(stdscr, "Snapshot 목록", lines)
+    
+    # 전체 통계 계산
+    total_snapshots = 0
+    for job_dirs in config_snapshot_map.values():
+        for job_dir in job_dirs:
+            index_file = job_dir / "index.json"
+            if index_file.exists():
+                try:
+                    with index_file.open("r", encoding="utf-8") as f:
+                        index = json.load(f)
+                    total_snapshots += len(index)
+                except:
+                    pass
+    
+    lines.append("")
+    lines.append(f"  📊 전체 통계: {len(config_snapshot_map)}개 Config, 총 {total_snapshots:,}개 스냅샷")
+    lines.append(f"  {'─' * 78}")
+    
+    # Config별로 표시
+    for config_name in sorted(config_snapshot_map.keys()):
+        job_dirs = config_snapshot_map[config_name]
+        
+        lines.append("")
+        lines.append(f"╔{'═' * 78}╗")
+        lines.append(f"║ 🗂️  Config: {config_name:<66} ║")
+        lines.append(f"╠{'═' * 78}╣")
+        
+        config_snapshot_count = 0
+        
+        # Config 내의 각 Job 처리
+        for idx, job_dir in enumerate(job_dirs):
+            index_file = job_dir / "index.json"
+            
+            if not index_file.exists():
+                lines.append("")
+                lines.append(f"╭{'─' * 78}╮")
+                lines.append(f"│ 📦 Job: {job_dir.name:<68} │")
+                lines.append(f"├{'─' * 78}┤")
+                lines.append(f"│   ⚠️  index.json 파일이 없습니다.{' ' * 44}│")
+                lines.append(f"╰{'─' * 78}╯")
+                continue
+            
+            try:
+                with index_file.open("r", encoding="utf-8") as f:
+                    index = json.load(f)
+                
+                snapshot_count = len(index)
+                config_snapshot_count += snapshot_count
+                
+                # Job 헤더
+                lines.append("")
+                lines.append(f"╭{'─' * 78}╮")
+                lines.append(f"│ 📦 Job: {job_dir.name:<68} │")
+                lines.append(f"├{'─' * 78}┤")
+                lines.append(f"│   총 스냅샷: {snapshot_count:,}개{' ' * (64 - len(f'{snapshot_count:,}'))}│")
+                lines.append(f"├{'─' * 78}┤")
+                
+                if snapshot_count == 0:
+                    lines.append(f"│   (스냅샷 없음){' ' * 62}│")
+                else:
+                    # 최근 5개만 표시
+                    recent_snapshots = index[-5:]
+                    
+                    for snap_idx, entry in enumerate(recent_snapshots, 1):
+                        timestamp = entry.get('timestamp', 'N/A')
+                        file_count = entry.get('file_count', 0)
+                        generated_at = entry.get('generated_at', 'N/A')
+                        snapshot_file = entry.get('snapshot_file', 'N/A')
+                        
+                        # 날짜/시간 포맷팅
+                        try:
+                            parts = timestamp.split('_')
+                            if len(parts) >= 3:
+                                date_part = parts[-2]
+                                time_part = parts[-1]
+                                formatted_date = f"{date_part[:4]}-{date_part[4:6]}-{date_part[6:8]}"
+                                formatted_time = f"{time_part[:2]}:{time_part[2:4]}:{time_part[4:6]}"
+                                display_datetime = f"{formatted_date} {formatted_time}"
+                            else:
+                                display_datetime = timestamp
+                        except:
+                            display_datetime = timestamp
+                        
+                        file_count_str = f"{file_count:,}".rjust(10)
+                        
+                        lines.append(f"│   [{snap_idx}] 📅 {display_datetime:<30} 📁 {file_count_str}개 │")
+                    
+                    # 더 많은 스냅샷이 있는 경우
+                    if snapshot_count > 5:
+                        remaining = snapshot_count - 5
+                        lines.append(f"│   ... 외 {remaining:,}개의 이전 스냅샷{' ' * (52 - len(f'{remaining:,}'))}│")
+                
+                lines.append(f"╰{'─' * 78}╯")
+                
+            except Exception as e:
+                lines.append("")
+                lines.append(f"╭{'─' * 78}╮")
+                lines.append(f"│ 📦 Job: {job_dir.name:<68} │")
+                lines.append(f"├{'─' * 78}┤")
+                lines.append(f"│   ❌ 에러: {str(e)[:64]:<64}│")
+                lines.append(f"╰{'─' * 78}╯")
+        
+        # Config 요약
+        lines.append(f"╠{'═' * 78}╣")
+        lines.append(f"║ Config 합계: {config_snapshot_count:,}개 스냅샷{' ' * (62 - len(f'{config_snapshot_count:,}'))}║")
+        lines.append(f"╚{'═' * 78}╝")
+    
+    show_text_screen(stdscr, "📸 Snapshot 목록", lines)
 
 
 # ================ config 선택 / 메뉴 기반 backup 실행 =================
@@ -2757,27 +3173,38 @@ def interactive_main_plain():
             input("계속하려면 Enter...")
 
         elif choice == '4':
-            snapshots_root = base_log_dir / "snapshots"
-            if not snapshots_root.exists():
+            # config별로 스냅샷 표시
+            config_found = False
+            for config_dir in sorted(base_log_dir.iterdir()):
+                if not config_dir.is_dir():
+                    continue
+                snapshots_root = config_dir / "snapshots"
+                if not snapshots_root.exists():
+                    continue
+                
+                print(f"\n╔{'═' * 60}╗")
+                print(f"║ Config: {config_dir.name:<52} ║")
+                print(f"╚{'═' * 60}╝")
+                config_found = True
+                
+                for job_dir in sorted(snapshots_root.iterdir()):
+                    if not job_dir.is_dir():
+                        continue
+                    index_file = job_dir / "index.json"
+                    if not index_file.exists():
+                        print(f"  [{job_dir.name}] index.json 없음")
+                        continue
+                    with index_file.open("r", encoding="utf-8") as f:
+                        index = json.load(f)
+                    print(f"\n  Job: {job_dir.name} (snapshots: {len(index)})")
+                    for entry in index[-5:]:
+                        print(
+                            f"    ts={entry.get('timestamp')} | count={entry.get('file_count'):,}"
+                        )
+            
+            if not config_found:
                 print("snapshots 디렉토리가 없습니다.")
-                input("계속하려면 Enter...")
-                continue
-            for job_dir in sorted(snapshots_root.iterdir()):
-                if not job_dir.is_dir():
-                    continue
-                index_file = job_dir / "index.json"
-                if not index_file.exists():
-                    print(f"[{job_dir.name}] index.json 없음")
-                    continue
-                with index_file.open("r", encoding="utf-8") as f:
-                    index = json.load(f)
-                print(f"=== Job: {job_dir.name} (snapshots: {len(index)}) ===")
-                for entry in index[-20:]:
-                    print(
-                        f"  ts={entry.get('timestamp')} | file={entry.get('snapshot_file')} "
-                        f"| count={entry.get('file_count')} | at={entry.get('generated_at')}"
-                    )
-            input("계속하려면 Enter...")
+            input("\n계속하려면 Enter...")
 
         elif choice == '5':
             print("기존 config 수정(E), 새 config 생성(N), 취소(Q)")
@@ -2908,21 +3335,73 @@ def interactive_main_plain():
 # ================ main 진입점 =================
 
 def main() -> None:
-    if len(sys.argv) == 1:
-        if sys.stdout.isatty() and curses is not None:
-            curses.wrapper(interactive_main_curses)
-        else:
-            interactive_main_plain()
-        return
+    # 프로그램 중복 실행 방지
+    lock_file = Path(__file__).parent / "logs" / ".disk_sync_pro.lock"
+    instance_lock = SingleInstanceLock(lock_file)
+    
+    if not instance_lock.acquire():
+        # PID 파일에서 정보 읽기
+        pid_file = lock_file.with_suffix('.pid')
+        pid = "unknown"
+        timestamp = "unknown"
+        
+        try:
+            with open(pid_file, 'r') as f:
+                lines = f.readlines()
+                pid = lines[0].strip() if len(lines) > 0 else "unknown"
+                timestamp = lines[1].strip() if len(lines) > 1 else "unknown"
+        except Exception:
+            # PID 파일 읽기 실패 시 lock 파일에서 시도
+            try:
+                with open(lock_file, 'r') as f:
+                    lines = f.readlines()
+                    pid = lines[0].strip() if len(lines) > 0 else "unknown"
+                    timestamp = lines[1].strip() if len(lines) > 1 else "unknown"
+            except Exception:
+                pass
+        
+        error_msg = f"""
+╔══════════════════════════════════════════════════════════════╗
+║                   프로그램 중복 실행 감지                    ║
+╚══════════════════════════════════════════════════════════════╝
 
-    args = parse_args()
-    if args.command == "backup":
-        main_backup(args)
-    elif args.command == "rollback":
-        main_rollback(args)
-    else:
-        print("알 수 없는 명령입니다.", file=sys.stderr)
+DiskSyncPro가 이미 실행 중입니다.
+
+실행 중인 프로세스:
+  - PID: {pid}
+  - 시작 시간: {timestamp}
+  - Lock 파일: {lock_file}
+
+동시에 여러 백업을 실행하면 데이터 손상이 발생할 수 있습니다.
+
+해결 방법:
+  1. 실행 중인 프로그램이 종료될 때까지 기다리세요
+  2. 프로그램이 비정상 종료되었다면:
+     rm {lock_file}
+     rm {pid_file}
+"""
+        print(error_msg, file=sys.stderr)
         sys.exit(1)
+    
+    try:
+        if len(sys.argv) == 1:
+            if sys.stdout.isatty() and curses is not None:
+                curses.wrapper(interactive_main_curses)
+            else:
+                interactive_main_plain()
+            return
+
+        args = parse_args()
+        if args.command == "backup":
+            main_backup(args)
+        elif args.command == "rollback":
+            main_rollback(args)
+        else:
+            print("알 수 없는 명령입니다.", file=sys.stderr)
+            sys.exit(1)
+    finally:
+        # 명시적으로 lock 해제 (atexit에서도 해제되지만 확실하게)
+        instance_lock.release()
 
 
 if __name__ == "__main__":
