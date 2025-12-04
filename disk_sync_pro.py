@@ -20,7 +20,11 @@ CCC + SuperDuper 스타일을 참고한, 비교적 안전한 디스크 백업/�
   - Job 실행 동안 이루어진 변경을 모두 기록
   - 에러 발생 시 자동 롤백 시도
   - 나중에 --rollback 으로 수동 롤백 가능
-- 기본적인 재시도 로직
+- 복사 실패 파일은 스킵 (전체 Job은 계속 진행)
+- 스냅샷 인덱싱 (snapshot + index.json)
+- resume checkpoint (--resume 사용 시, 중단된 지점 이후부터 이어서 실행)
+- 변경 요약 리포트(summary_*.json) 생성
+- 진행률 로그 (0~100%) 지원
 
 주의:
 - macOS 데이터 디스크/외장 SSD 백업을 염두에 둔 스크립트
@@ -109,6 +113,18 @@ class Journal:
     ops: List[JournalOp]
 
 
+@dataclass
+class Stats:
+    created_files: int = 0
+    replaced_files: int = 0
+    deleted_files: int = 0
+    safetynet_files: int = 0
+    created_dirs: int = 0
+    skipped_same: int = 0
+    skipped_excluded: int = 0
+    copy_failed: int = 0
+
+
 # ================ 설정 로딩 =================
 
 def load_config(config_path: Path) -> List[BackupJob]:
@@ -194,7 +210,8 @@ def atomic_copy(src: Path, dst: Path) -> None:
     os.replace(tmp_path, dst)
 
 
-def ensure_dir(path: Path, journal: Optional[Journal] = None, dry_run: bool = False) -> None:
+def ensure_dir(path: Path, journal: Optional[Journal] = None,
+               stats: Optional[Stats] = None, dry_run: bool = False) -> None:
     """
     디렉토리 생성. 롤백을 위해 create_dir 기록.
     """
@@ -206,6 +223,8 @@ def ensure_dir(path: Path, journal: Optional[Journal] = None, dry_run: bool = Fa
     path.mkdir(parents=True, exist_ok=True)
     if journal:
         journal.ops.append(JournalOp(action="create_dir", target=str(path)))
+    if stats:
+        stats.created_dirs += 1
 
 
 # ================ SafetyNet / Rollback 영역 =================
@@ -280,6 +299,82 @@ def load_journal(path: Path) -> Journal:
     )
 
 
+# ================ Checkpoint (resume) =================
+
+def load_or_init_checkpoint(job: BackupJob, log_dir: Path) -> dict:
+    """
+    checkpoint_<job>.json 파일을 읽어오거나 새로 생성.
+    status != 'incomplete' 인 경우 processed 는 초기화.
+    """
+    path = log_dir / f"checkpoint_{job.name}.json"
+    if path.exists():
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        status = data.get("status", "incomplete")
+        if status == "incomplete":
+            processed = set(data.get("processed_files", []))
+        else:
+            processed = set()
+    else:
+        status = "incomplete"
+        processed = set()
+    cp = {
+        "job_name": job.name,
+        "status": status,
+        "processed": processed,
+        "path": path,
+    }
+    return cp
+
+
+def save_checkpoint(cp: dict) -> None:
+    if cp is None:
+        return
+    path: Path = cp["path"]
+    data = {
+        "job_name": cp["job_name"],
+        "status": cp["status"],
+        "processed_files": sorted(list(cp["processed"])),
+        "last_updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def add_processed_file(cp: Optional[dict], rel_path: str) -> None:
+    """
+    체크포인트에 '이미 처리된 파일'로 기록.
+    """
+    if cp is None:
+        return
+    if rel_path in cp["processed"]:
+        return
+    cp["processed"].add(rel_path)
+    save_checkpoint(cp)
+
+
+# ================ 진행률 계산용 =================
+
+def count_total_files_for_job(job: BackupJob) -> int:
+    """
+    진행률 계산을 위해 소스 아래 '대상 파일 수'를 미리 샘.
+    exclude 패턴에 걸리는 파일은 제외.
+    """
+    total = 0
+    for root, dirs, files in os.walk(job.source):
+        root_path = Path(root)
+        # 제외 디렉토리 필터링
+        dirs[:] = [d for d in dirs if not path_matches_patterns(root_path / d, job.exclude)]
+
+        for f in files:
+            p = root_path / f
+            if path_matches_patterns(p, job.exclude):
+                continue
+            total += 1
+    return total
+
+
 # ================ 롤백 =================
 
 def rollback_journal(journal: Journal, dry_run: bool = False) -> None:
@@ -287,9 +382,7 @@ def rollback_journal(journal: Journal, dry_run: bool = False) -> None:
     Journal 을 역순으로 읽어 롤백 수행.
     """
     logger.info(f"=== 롤백 시작: job={journal.job_name}, ts={journal.timestamp} ===")
-    # dest_root = Path(journal.dest_root)  # 현재는 사용하지 않지만 유지
 
-    # 가장 마지막 작업부터 되돌림
     for op in reversed(journal.ops):
         target = Path(op.target)
         backup = Path(op.backup) if op.backup else None
@@ -333,7 +426,7 @@ def rollback_journal(journal: Journal, dry_run: bool = False) -> None:
 # ================ 핵심 백업 로직 =================
 
 def copy_with_retry(src: Path, dst: Path, verify: bool, journal: Journal,
-                    dry_run: bool = False) -> bool:
+                    stats: Stats, dry_run: bool = False) -> bool:
     """
     원자적 복사 + 재시도 + 해시 검증 + 저널 기록
     실패 시 예외를 올리지 않고 False 를 반환해서
@@ -352,18 +445,19 @@ def copy_with_retry(src: Path, dst: Path, verify: bool, journal: Journal,
             shutil.copy2(dst, backup_path)
         except Exception as e:
             logger.error(f"[BACKUP 실패] {dst} -> {backup_path}: {e}")
-            # 백업 실패해도, 일단 복사 시도는 진행할지 여부는 정책인데
-            # 여기서는 계속 진행하도록 함.
 
     # 실제 복사
     if dry_run:
         logger.info(f"[COPY (dry-run)] {src} -> {dst}")
-        # dry-run 은 항상 성공으로 간주
         journal.ops.append(JournalOp(
             action=action,
             target=str(dst),
             backup=str(backup_path) if backup_path else None
         ))
+        if action == "create_file":
+            stats.created_files += 1
+        else:
+            stats.replaced_files += 1
         return True
     else:
         success = False
@@ -383,7 +477,7 @@ def copy_with_retry(src: Path, dst: Path, verify: bool, journal: Journal,
 
         if not success:
             logger.error(f"[SKIP] 최대 재시도 실패로 이 파일은 스킵합니다: {src}")
-            # 실패했으므로 저널에 기록하지 않음 (롤백 대상 아님)
+            stats.copy_failed += 1
             return False
 
     # 성공 시에만 저널 기록
@@ -392,10 +486,113 @@ def copy_with_retry(src: Path, dst: Path, verify: bool, journal: Journal,
         target=str(dst),
         backup=str(backup_path) if backup_path else None
     ))
+    if action == "create_file":
+        stats.created_files += 1
+    else:
+        stats.replaced_files += 1
     return True
 
 
-def perform_backup(job: BackupJob, dry_run: bool, log_dir: Path) -> None:
+# ================ Snapshot & Summary =================
+
+def build_snapshot(job: BackupJob, journal: Journal, log_dir: Path) -> Path:
+    """
+    백업 완료 후 destination 전체 스냅샷(manifest) 생성.
+    snapshots/<job_name>/snapshot_<timestamp>.json
+    + index.json 업데이트.
+    """
+    dest_root = job.destination
+    snapshot_dir = log_dir / "snapshots" / job.name
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+    files_manifest = []
+
+    for root, dirs, files in os.walk(dest_root):
+        root_path = Path(root)
+        # 내부 관리 디렉토리는 스냅샷에서 제외
+        if any(x in root_path.parts for x in (".Rollback", ".SafetyNet")):
+            dirs[:] = []
+            continue
+
+        for f in files:
+            file_path = root_path / f
+            rel_path = file_path.relative_to(dest_root).as_posix()
+            st = file_path.stat()
+            entry = {
+                "path": rel_path,
+                "size": st.st_size,
+                "mtime": int(st.st_mtime),
+            }
+            if job.verify:
+                entry["hash"] = file_hash(file_path)
+            files_manifest.append(entry)
+
+    snapshot_data = {
+        "job_name": job.name,
+        "timestamp": journal.timestamp,
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "mode": job.mode,
+        "source": str(job.source),
+        "destination": str(job.destination),
+        "file_count": len(files_manifest),
+        "files": files_manifest,
+    }
+
+    snapshot_file = snapshot_dir / f"snapshot_{journal.timestamp}.json"
+    with snapshot_file.open("w", encoding="utf-8") as f:
+        json.dump(snapshot_data, f, indent=2, ensure_ascii=False)
+
+    # index.json 업데이트
+    index_file = snapshot_dir / "index.json"
+    if index_file.exists():
+        with index_file.open("r", encoding="utf-8") as f:
+            index = json.load(f)
+    else:
+        index = []
+
+    index.append({
+        "timestamp": journal.timestamp,
+        "snapshot_file": snapshot_file.name,
+        "file_count": len(files_manifest),
+        "generated_at": snapshot_data["generated_at"],
+    })
+
+    with index_file.open("w", encoding="utf-8") as f:
+        json.dump(index, f, indent=2, ensure_ascii=False)
+
+    return snapshot_file
+
+
+def write_summary(job: BackupJob, journal: Journal, stats: Stats, log_dir: Path) -> Path:
+    """
+    변경 요약 리포트 JSON 생성.
+    """
+    summary = {
+        "job_name": job.name,
+        "timestamp": journal.timestamp,
+        "mode": job.mode,
+        "source": str(job.source),
+        "destination": str(job.destination),
+        "stats": asdict(stats),
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+    summary_file = log_dir / f"summary_{job.name}_{journal.timestamp}.json"
+    with summary_file.open("w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+
+    # 로그에도 간단 요약 출력
+    logger.info("=== 변경 요약 ===")
+    for k, v in summary["stats"].items():
+        logger.info(f"{k}: {v}")
+    logger.info("================")
+
+    return summary_file
+
+
+# ================ Backup 실행 =================
+
+def perform_backup(job: BackupJob, dry_run: bool, log_dir: Path, resume: bool) -> None:
     logger.info(f"=== Job 시작: {job.name} ===")
     logger.info(f"  Source      : {job.source}")
     logger.info(f"  Destination : {job.destination}")
@@ -403,6 +600,7 @@ def perform_backup(job: BackupJob, dry_run: bool, log_dir: Path) -> None:
     logger.info(f"  Exclude     : {job.exclude}")
     logger.info(f"  Verify      : {job.verify}")
     logger.info(f"  Dry-run     : {dry_run}")
+    logger.info(f"  Resume      : {resume}")
 
     if not job.source.exists():
         logger.error(f"소스 경로가 존재하지 않습니다: {job.source}")
@@ -415,11 +613,51 @@ def perform_backup(job: BackupJob, dry_run: bool, log_dir: Path) -> None:
     if not dry_run:
         job.destination.mkdir(parents=True, exist_ok=True)
 
+    # 진행률용 전체 파일 수 계산
+    total_files = count_total_files_for_job(job)
+    if total_files == 0:
+        logger.info("처리할 대상 파일이 없습니다. (0개)")
+    else:
+        logger.info(f"총 처리 대상 파일 수: {total_files}")
+
     # 저널 준비
     journal = prepare_journal(job)
     journal_file = journal_path_for(job, log_dir, journal.timestamp)
     logger.info(f"저널 파일: {journal_file}")
     save_journal(journal, journal_file)
+
+    # 통계
+    stats = Stats()
+
+    # 체크포인트 (dry_run 이면 사용 안 함)
+    cp = None
+    already_processed = 0
+    if resume and not dry_run:
+        cp = load_or_init_checkpoint(job, log_dir)
+        cp["status"] = "incomplete"
+        already_processed = len(cp["processed"])
+        save_checkpoint(cp)
+        if total_files > 0 and already_processed > 0:
+            logger.info(f"Resume 기준 이미 처리된 파일: {already_processed}개")
+
+    # 진행률 상태 변수
+    current_processed = min(already_processed, total_files) if total_files > 0 else 0
+    last_percent = int(current_processed * 100 / total_files) if total_files > 0 else 100
+
+    if total_files > 0:
+        logger.info(f"[PROGRESS] {job.name}: {last_percent}% ({current_processed}/{total_files})")
+
+    def report_progress():
+        nonlocal current_processed, last_percent
+        if total_files == 0:
+            return
+        current_processed += 1
+        if current_processed > total_files:
+            current_processed = total_files
+        percent = int(current_processed * 100 / total_files)
+        if percent > last_percent:
+            last_percent = percent
+            logger.info(f"[PROGRESS] {job.name}: {percent}% ({current_processed}/{total_files})")
 
     try:
         # 1) 소스 기준 복사/업데이트
@@ -432,17 +670,27 @@ def perform_backup(job: BackupJob, dry_run: bool, log_dir: Path) -> None:
             rel_root = root_path.relative_to(job.source)
             dest_root = job.destination / rel_root
 
-            ensure_dir(dest_root, journal=journal, dry_run=dry_run)
+            ensure_dir(dest_root, journal=journal, stats=stats, dry_run=dry_run)
 
             for file in files:
                 src_file = root_path / file
                 if path_matches_patterns(src_file, job.exclude):
+                    stats.skipped_excluded += 1
+                    continue
+
+                rel_path = src_file.relative_to(job.source).as_posix()
+
+                # resume 체크: 이미 처리한 파일이면 스킵 (진행률도 이미 반영된 상태로 봄)
+                if cp is not None and rel_path in cp["processed"]:
                     continue
 
                 dst_file = dest_root / file
 
-                # 같으면 스킵
+                # 같으면 스킵 (그래도 한 파일은 검사한 것이므로 진행률 1 step)
                 if dst_file.exists() and is_same_file(src_file, dst_file):
+                    stats.skipped_same += 1
+                    add_processed_file(cp, rel_path)
+                    report_progress()
                     continue
 
                 ok = copy_with_retry(
@@ -450,11 +698,13 @@ def perform_backup(job: BackupJob, dry_run: bool, log_dir: Path) -> None:
                     dst_file,
                     verify=job.verify,
                     journal=journal,
+                    stats=stats,
                     dry_run=dry_run,
                 )
-                if not ok:
-                    # 이 파일만 스킵하고 계속 진행
-                    continue
+                if ok:
+                    add_processed_file(cp, rel_path)
+                # 실패하더라도 "이 파일에 대한 시도"는 했으므로 진행률 1 step
+                report_progress()
 
         # 2) clone/safety_net 모드에서, 소스에 없는 파일 정리
         if job.mode in ("clone", "safety_net"):
@@ -495,9 +745,9 @@ def perform_backup(job: BackupJob, dry_run: bool, log_dir: Path) -> None:
                                         target=str(dst_file),
                                         backup=str(backup_path),
                                     ))
+                                    stats.deleted_files += 1
                                 except Exception as e:
                                     logger.error(f"[DELETE BACKUP 실패] {dst_file}: {e}")
-                                    # 삭제 실패해도 일단 계속 진행
                         elif job.mode == "safety_net":
                             try:
                                 sn_path = move_to_safety_net(dst_file, job.destination, dry_run=dry_run)
@@ -506,9 +756,9 @@ def perform_backup(job: BackupJob, dry_run: bool, log_dir: Path) -> None:
                                     target=str(dst_file),
                                     backup=str(sn_path),
                                 ))
+                                stats.safetynet_files += 1
                             except Exception as e:
                                 logger.error(f"[SafetyNet 이동 실패] {dst_file}: {e}")
-                                # 실패 시에도 계속 진행
 
             # clone 모드에서 비어있는 디렉토리 정리
             if job.mode == "clone" and not dry_run:
@@ -528,8 +778,26 @@ def perform_backup(job: BackupJob, dry_run: bool, log_dir: Path) -> None:
                             # 비어 있지 않으면 무시
                             pass
 
+        # 안전하게 마지막 100% 보정
+        if total_files > 0 and current_processed < total_files:
+            current_processed = total_files
+            logger.info(f"[PROGRESS] {job.name}: 100% ({current_processed}/{total_files})")
+
         journal.status = "success"
         save_journal(journal, journal_file)
+
+        # 체크포인트 완료 표시
+        if cp is not None and not dry_run:
+            cp["status"] = "complete"
+            save_checkpoint(cp)
+
+        # 스냅샷 & 요약 리포트 생성 (dry-run 이 아닐 때만)
+        if not dry_run:
+            snapshot_file = build_snapshot(job, journal, log_dir)
+            summary_file = write_summary(job, journal, stats, log_dir)
+            logger.info(f"스냅샷 파일: {snapshot_file}")
+            logger.info(f"요약 리포트: {summary_file}")
+
         logger.info(f"=== Job 성공: {job.name} ===")
 
     except Exception as e:
@@ -560,6 +828,8 @@ def parse_args() -> argparse.Namespace:
     backup_parser.add_argument("-j", "--job", help="실행할 Job 이름 (생략 시 전체 Job 실행)")
     backup_parser.add_argument("--dry-run", action="store_true", help="실제 복사/삭제 없이 시뮬레이션만 수행")
     backup_parser.add_argument("--log-dir", help="로그/저널 저장 디렉토리 (기본: ./logs)")
+    backup_parser.add_argument("--resume", action="store_true",
+                               help="이전 체크포인트를 사용해 중단된 백업을 이어서 실행")
 
     # rollback 명령
     rollback_parser = subparsers.add_parser("rollback", help="기존 저널 파일을 이용해 롤백 실행")
@@ -598,7 +868,7 @@ def main_backup(args: argparse.Namespace) -> None:
             sys.exit(1)
 
     for job in jobs:
-        perform_backup(job, dry_run=args.dry_run, log_dir=log_dir)
+        perform_backup(job, dry_run=args.dry_run, log_dir=log_dir, resume=args.resume)
 
     logger.info("모든 Job이 완료되었습니다.")
 
