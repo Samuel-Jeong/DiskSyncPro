@@ -1,0 +1,100 @@
+# -------------------------
+# Python bytecode / cache
+# -------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+
+
+# -------------------------
+# Virtual Environment (venv)
+# -------------------------
+venv/
+.env/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+
+# -------------------------
+# macOS system files
+# -------------------------
+.DS_Store
+.AppleDouble
+.LSOverride
+
+
+# -------------------------
+# macOS metadata files on external storage
+# -------------------------
+.Spotlight-V100
+.Trashes
+.fseventsd
+.metadata_never_index
+
+
+# -------------------------
+# Logs
+# -------------------------
+*.log
+logs/
+journal_*.json
+
+
+# -------------------------
+# Editor / IDE
+# -------------------------
+
+# VSCode
+.vscode/
+.vscode/*
+
+# PyCharm/JetBrains
+.idea/
+
+# Sublime
+*.sublime-workspace
+*.sublime-project
+
+
+# -------------------------
+# Test / coverage artifacts
+# -------------------------
+htmlcov/
+.tox/
+.nox/
+.pytest_cache/
+.coverage
+.cache
+coverage.xml
+*.cover
+*.py,cover
+
+
+# -------------------------
+# Build / distribution
+# -------------------------
+build/
+dist/
+*.egg-info/
+.eggs/
+MANIFEST
+
+
+# -------------------------
+# Backup files
+# -------------------------
+*.bak
+*.tmp
+
+
+# -------------------------
+# Optional (if user stores env vars)
+# -------------------------
+*.env
+*.secret
+.env.local
+.env.prod
+.env.dev
