@@ -3122,153 +3122,664 @@ def interactive_select_job_curses(stdscr, config_path: Path) -> (Optional[str], 
         return job_name, dry_run, resume, False
 
 
-def interactive_config_editor_curses(stdscr):
-    """Config 편집 화면"""
-    rows, cols = stdscr.getmaxyx()
-    stdscr.clear()
-    title = " Config 생성/수정 ".center(cols, "=")
-    safe_addstr(stdscr, 0, 0, title)
-    safe_addstr(stdscr, 2, 0, "기존 config 수정(E), 새 config 생성(N), 취소(Q)")
-    stdscr.refresh()
-
-    choice = curses_prompt(stdscr, "선택(E/N/Q): ").lower()
-    if not choice or choice == 'q':
-        return
-
-    if choice == 'n':
-        path_str = curses_input_line(stdscr, "새로 만들 config JSON 경로 (예: ./configs/my_backup.json):")
-        if not path_str:
-            return
-        config_path = Path(path_str).expanduser()
-        jobs: List[BackupJob] = []
-    else:
-        config_path = interactive_select_config_curses(stdscr)
-        if config_path is None:
-            return
-        try:
-            jobs = load_config(config_path)
-        except Exception as e:
-            show_text_screen(stdscr, "오류", [f"config 읽기 실패: {e}"])
-            return
-
+def show_config_manager_main_menu(stdscr):
+    """Config 관리 메인 메뉴 - CRUD"""
     while True:
         stdscr.clear()
-        title = f" Config 편집: {config_path.name} ".center(cols, "=")
+        rows, cols = stdscr.getmaxyx()
+        
+        title = " ⚙️  Config 관리 (CRUD) ".center(cols, "=")
         safe_addstr(stdscr, 0, 0, title)
+        
+        # Config 파일 목록
+        configs = find_config_files()
+        
+        safe_addstr(stdscr, 2, 2, f"📁 발견된 Config 파일: {len(configs)}개")
+        safe_addstr(stdscr, 3, 2, "─" * (cols - 4))
+        
+        menu_row = 5
+        safe_addstr(stdscr, menu_row, 2, "메뉴:")
+        menu_row += 1
+        safe_addstr(stdscr, menu_row, 4, "1) 📋 Config 목록 보기 (Read)")
+        menu_row += 1
+        safe_addstr(stdscr, menu_row, 4, "2) ➕ 새 Config 생성 (Create)")
+        menu_row += 1
+        safe_addstr(stdscr, menu_row, 4, "3) ✏️  Config 수정 (Update)")
+        menu_row += 1
+        safe_addstr(stdscr, menu_row, 4, "4) 🗑️  Config 삭제 (Delete)")
+        menu_row += 1
+        safe_addstr(stdscr, menu_row, 4, "5) 📝 템플릿으로 생성")
+        menu_row += 1
+        safe_addstr(stdscr, menu_row, 4, "6) ✅ Config 검증")
+        menu_row += 2
+        safe_addstr(stdscr, menu_row, 4, "Q) 메인 메뉴로 돌아가기")
+        
+        safe_addstr(stdscr, rows - 1, 0, "[1-6] 메뉴 선택  [Q] 돌아가기")
+        stdscr.refresh()
+        
+        ch = stdscr.getch()
+        
+        if ch in (ord('q'), ord('Q'), 27):
+            break
+        elif ch == ord('1'):
+            show_config_list_screen(stdscr)
+        elif ch == ord('2'):
+            create_new_config_curses(stdscr)
+        elif ch == ord('3'):
+            update_config_curses(stdscr)
+        elif ch == ord('4'):
+            delete_config_curses(stdscr)
+        elif ch == ord('5'):
+            create_from_template_curses(stdscr)
+        elif ch == ord('6'):
+            validate_config_curses(stdscr)
 
-        if not jobs:
-            safe_addstr(stdscr, 2, 0, "현재 등록된 Job 이 없습니다.")
-        else:
-            safe_addstr(stdscr, 2, 0, "수정할 Job 을 선택하세요.")
-            safe_addstr(stdscr, 3, 0, "0) 새 Job 추가")
-            row = 4
-            for idx, job in enumerate(jobs, start=1):
-                line = f"{idx}) {job.name} (mode={job.mode}, src={job.source}, dst={job.destination})"
-                if row >= rows - 4:
-                    break
-                safe_addstr(stdscr, row, 0, line)
-                row += 1
 
-        safe_addstr(stdscr, rows - 3, 0, "Q) 취소")
-        sel = curses_prompt(stdscr, "선택 번호 입력 (0=새 Job, Q=취소): ").lower()
-
-        if not sel or sel == 'q':
-            return
-
-        if sel == '0':
-            job = BackupJob(
-                name="",
-                source=Path("."),
-                destination=Path("."),
-                mode="safety_net",
-                exclude=[],
-                safety_net_days=30,
-                verify=False,
-            )
-            jobs.append(job)
-            editing_job = job
-        else:
-            try:
-                idx = int(sel)
-            except ValueError:
-                continue
-            if not (1 <= idx <= len(jobs)):
-                continue
-            editing_job = jobs[idx - 1]
-
-        def edit_field(label: str, current: str) -> str:
-            value = curses_input_line(stdscr, label, default=current)
-            return value if value else current
-
-        editing_job.name = edit_field("Job 이름", editing_job.name or "")
-        editing_job.source = Path(edit_field("Source 경로", str(editing_job.source))).expanduser()
-        editing_job.destination = Path(edit_field("Destination 경로", str(editing_job.destination))).expanduser()
-
-        mode_val = edit_field("Mode (clone/sync/safety_net)", editing_job.mode)
-        if mode_val in ("clone", "sync", "safety_net"):
-            editing_job.mode = mode_val
-
-        excl_str_current = ", ".join(editing_job.exclude) if editing_job.exclude else ""
-        excl_str = edit_field("Exclude 패턴 (쉼표 구분, 예: .DS_Store,*.tmp)", excl_str_current)
-        if excl_str:
-            editing_job.exclude = [x.strip() for x in excl_str.split(",") if x.strip()]
-
-        days_str = edit_field("SafetyNet 보관일 수", str(editing_job.safety_net_days))
-        if days_str:
-            try:
-                editing_job.safety_net_days = int(days_str)
-            except ValueError:
-                pass
-
-        v_str = edit_field("해시 검증(verify) 사용? (y/n)", "y" if editing_job.verify else "n")
-        if v_str.lower() in ("y", "yes"):
-            editing_job.verify = True
-        elif v_str.lower() in ("n", "no"):
-            editing_job.verify = False
-
-        raw = {
-            "jobs": [
-                {
-                    "name": j.name,
-                    "source": str(j.source),
-                    "destination": str(j.destination),
-                    "mode": j.mode,
-                    "exclude": j.exclude,
-                    "safety_net_days": j.safety_net_days,
-                    "verify": j.verify,
-                }
-                for j in jobs
-            ]
-        }
-        try:
-            config_path.parent.mkdir(parents=True, exist_ok=True)
-            # 원자적 쓰기
-            tmp_path = config_path.with_suffix('.tmp')
-            with tmp_path.open("w", encoding="utf-8") as f:
-                json.dump(raw, f, indent=2, ensure_ascii=False)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_path, config_path)
-        except Exception as e:
-            show_text_screen(stdscr, "오류", [f"config 저장 실패: {e}"])
-            try:
-                if tmp_path.exists():
-                    tmp_path.unlink()
-            except Exception:
-                pass
-            return
-
-        show_text_screen(
-            stdscr,
-            "Config 저장 완료",
-            [
-                f"파일: {config_path}",
-                f"Job 수: {len(jobs)}",
-                "",
-                "Config 저장을 완료했습니다.",
-            ],
-        )
+def show_config_list_screen(stdscr):
+    """Config 목록 상세 보기"""
+    configs = find_config_files()
+    rows, cols = stdscr.getmaxyx()
+    
+    lines = []
+    lines.append("")
+    lines.append(f"  📊 전체 Config 파일: {len(configs)}개")
+    lines.append(f"  {'─' * 78}")
+    lines.append("")
+    
+    if not configs:
+        lines.append("  ⚠️  Config 파일이 없습니다.")
+        lines.append("")
+        lines.append("  새 Config를 생성하려면 메뉴에서 '2) 새 Config 생성'을 선택하세요.")
+        show_text_screen(stdscr, "📋 Config 목록", lines)
         return
+    
+    for idx, config_path in enumerate(configs, 1):
+        lines.append(f"╭{'─' * 78}╮")
+        lines.append(f"│ [{idx}] 📄 {config_path.name:<70} │")
+        lines.append(f"├{'─' * 78}┤")
+        lines.append(f"│ 경로: {str(config_path)[:74]:<74} │")
+        
+        try:
+            jobs = load_config(config_path)
+            lines.append(f"│ Job 수: {len(jobs):<70} │")
+            lines.append(f"├{'─' * 78}┤")
+            
+            if jobs:
+                for job_idx, job in enumerate(jobs[:3], 1):  # 최대 3개만 표시
+                    lines.append(f"│   [{job_idx}] {job.name:<68} │")
+                    lines.append(f"│       모드: {job.mode:<64} │")
+                    lines.append(f"│       소스: {str(job.source)[:64]:<64} │")
+                    lines.append(f"│       대상: {str(job.destination)[:64]:<64} │")
+                    if job_idx < len(jobs) and job_idx < 3:
+                        lines.append(f"│{' ' * 78}│")
+                
+                if len(jobs) > 3:
+                    remaining = len(jobs) - 3
+                    lines.append(f"│   ... 외 {remaining}개 Job{' ' * (66 - len(str(remaining)))}│")
+            else:
+                lines.append(f"│   (Job 없음){' ' * 66}│")
+        except Exception as e:
+            lines.append(f"│ ❌ 로드 실패: {str(e)[:64]:<64} │")
+        
+        lines.append(f"╰{'─' * 78}╯")
+        lines.append("")
+    
+    show_text_screen(stdscr, "📋 Config 목록", lines)
+
+
+def create_new_config_curses(stdscr):
+    """새 Config 생성 (사용자 친화적)"""
+    stdscr.clear()
+    rows, cols = stdscr.getmaxyx()
+    
+    title = " ➕ 새 Config 생성 ".center(cols, "=")
+    safe_addstr(stdscr, 0, 0, title)
+    safe_addstr(stdscr, 2, 2, "새로 만들 Config 파일 경로를 입력하세요.")
+    safe_addstr(stdscr, 3, 2, "예: backup_config.json 또는 configs/my_backup.json")
+    stdscr.refresh()
+    
+    # 경로 입력
+    path_str = curses_input_line(stdscr, "Config 파일 경로 (확장자 .json 자동 추가):")
+    if not path_str:
+        return
+    
+    # .json 확장자 자동 추가
+    if not path_str.endswith('.json'):
+        path_str += '.json'
+    
+    config_path = Path(path_str).expanduser()
+    
+    # 이미 존재하는지 확인
+    if config_path.exists():
+        stdscr.clear()
+        safe_addstr(stdscr, 0, 0, title)
+        safe_addstr(stdscr, 3, 2, f"⚠️  파일이 이미 존재합니다: {config_path}")
+        safe_addstr(stdscr, 5, 2, "덮어쓰시겠습니까? [y/N]:")
+        stdscr.refresh()
+        
+        ch = stdscr.getch()
+        if ch not in (ord('y'), ord('Y')):
+            return
+    
+    # 빈 Config 생성
+    jobs: List[BackupJob] = []
+    
+    # Job 관리 메뉴로 이동
+    manage_jobs_in_config_curses(stdscr, config_path, jobs)
+
+
+def update_config_curses(stdscr):
+    """Config 수정 (Job CRUD 포함)"""
+    configs = find_config_files()
+    
+    if not configs:
+        show_text_screen(stdscr, "오류", ["Config 파일이 없습니다.", "", "먼저 새 Config를 생성하세요."])
+        return
+    
+    # Config 선택
+    config_path = interactive_select_config_curses(stdscr)
+    if config_path is None:
+        return
+    
+    try:
+        jobs = load_config(config_path)
+    except Exception as e:
+        show_text_screen(stdscr, "오류", [f"Config 읽기 실패: {e}"])
+        return
+    
+    # Job 관리 메뉴로 이동
+    manage_jobs_in_config_curses(stdscr, config_path, jobs)
+
+
+def manage_jobs_in_config_curses(stdscr, config_path: Path, jobs: List[BackupJob]):
+    """Config 내의 Job 관리 (CRUD)"""
+    while True:
+        stdscr.clear()
+        rows, cols = stdscr.getmaxyx()
+        
+        title = f" ✏️  Config 편집: {config_path.name} ".center(cols, "=")
+        safe_addstr(stdscr, 0, 0, title)
+        
+        safe_addstr(stdscr, 2, 2, f"📦 현재 Job 수: {len(jobs)}개")
+        safe_addstr(stdscr, 3, 2, "─" * (cols - 4))
+        
+        row = 5
+        if jobs:
+            safe_addstr(stdscr, row, 2, "Job 목록:")
+            row += 1
+            for idx, job in enumerate(jobs, start=1):
+                if row >= rows - 12:
+                    safe_addstr(stdscr, row, 4, "... (더 많은 Job)")
+                    break
+                safe_addstr(stdscr, row, 4, f"{idx}) {job.name} [{job.mode}]")
+                row += 1
+                safe_addstr(stdscr, row, 7, f"src: {job.source}")
+                row += 1
+                safe_addstr(stdscr, row, 7, f"dst: {job.destination}")
+                row += 1
+        else:
+            safe_addstr(stdscr, row, 2, "⚠️  Job이 없습니다.")
+            row += 1
+        
+        row += 1
+        menu_start = row
+        safe_addstr(stdscr, row, 2, "작업:")
+        row += 1
+        safe_addstr(stdscr, row, 4, "A) ➕ Job 추가")
+        row += 1
+        safe_addstr(stdscr, row, 4, "E) ✏️  Job 수정")
+        row += 1
+        safe_addstr(stdscr, row, 4, "D) 🗑️  Job 삭제")
+        row += 1
+        safe_addstr(stdscr, row, 4, "C) 📋 Job 복제")
+        row += 1
+        safe_addstr(stdscr, row, 4, "V) 👁️  Job 상세 보기")
+        row += 1
+        safe_addstr(stdscr, row, 4, "S) 💾 저장 후 종료")
+        row += 1
+        safe_addstr(stdscr, row, 4, "Q) 저장 않고 종료")
+        
+        safe_addstr(stdscr, rows - 1, 0, "[A/E/D/C/V/S/Q] 메뉴 선택")
+        stdscr.refresh()
+        
+        ch = stdscr.getch()
+        
+        if ch in (ord('q'), ord('Q')):
+            # 변경사항 있는지 확인
+            stdscr.clear()
+            safe_addstr(stdscr, rows // 2, 2, "저장하지 않고 종료하시겠습니까? [y/N]:")
+            stdscr.refresh()
+            confirm = stdscr.getch()
+            if confirm in (ord('y'), ord('Y')):
+                break
+        elif ch in (ord('s'), ord('S')):
+            # 저장
+            if save_config_to_file(stdscr, config_path, jobs):
+                show_text_screen(stdscr, "저장 완료", [
+                    f"파일: {config_path}",
+                    f"Job 수: {len(jobs)}",
+                    "",
+                    "✅ Config가 성공적으로 저장되었습니다."
+                ])
+                break
+        elif ch in (ord('a'), ord('A')):
+            # Job 추가
+            new_job = create_job_interactive(stdscr)
+            if new_job:
+                jobs.append(new_job)
+        elif ch in (ord('e'), ord('E')):
+            # Job 수정
+            if not jobs:
+                show_text_screen(stdscr, "알림", ["수정할 Job이 없습니다."])
+                continue
+            job_idx = select_job_from_list(stdscr, jobs, "수정할 Job 선택")
+            if job_idx is not None:
+                edit_job_interactive(stdscr, jobs[job_idx])
+        elif ch in (ord('d'), ord('D')):
+            # Job 삭제
+            if not jobs:
+                show_text_screen(stdscr, "알림", ["삭제할 Job이 없습니다."])
+                continue
+            job_idx = select_job_from_list(stdscr, jobs, "삭제할 Job 선택")
+            if job_idx is not None:
+                stdscr.clear()
+                safe_addstr(stdscr, rows // 2, 2, f"'{jobs[job_idx].name}' Job을 삭제하시겠습니까? [y/N]:")
+                stdscr.refresh()
+                confirm = stdscr.getch()
+                if confirm in (ord('y'), ord('Y')):
+                    jobs.pop(job_idx)
+                    show_text_screen(stdscr, "삭제 완료", ["Job이 삭제되었습니다."])
+        elif ch in (ord('c'), ord('C')):
+            # Job 복제
+            if not jobs:
+                show_text_screen(stdscr, "알림", ["복제할 Job이 없습니다."])
+                continue
+            job_idx = select_job_from_list(stdscr, jobs, "복제할 Job 선택")
+            if job_idx is not None:
+                original_job = jobs[job_idx]
+                new_job = BackupJob(
+                    name=f"{original_job.name}_copy",
+                    source=original_job.source,
+                    destination=original_job.destination,
+                    mode=original_job.mode,
+                    exclude=original_job.exclude.copy(),
+                    safety_net_days=original_job.safety_net_days,
+                    verify=original_job.verify,
+                )
+                jobs.append(new_job)
+                show_text_screen(stdscr, "복제 완료", [f"'{new_job.name}' Job이 생성되었습니다."])
+        elif ch in (ord('v'), ord('V')):
+            # Job 상세 보기
+            if not jobs:
+                show_text_screen(stdscr, "알림", ["보기할 Job이 없습니다."])
+                continue
+            job_idx = select_job_from_list(stdscr, jobs, "상세 보기할 Job 선택")
+            if job_idx is not None:
+                show_job_details(stdscr, jobs[job_idx])
+
+
+def select_job_from_list(stdscr, jobs: List[BackupJob], title: str) -> Optional[int]:
+    """Job 목록에서 선택"""
+    stdscr.clear()
+    rows, cols = stdscr.getmaxyx()
+    
+    safe_addstr(stdscr, 0, 0, f" {title} ".center(cols, "="))
+    
+    row = 2
+    for idx, job in enumerate(jobs, start=1):
+        if row >= rows - 3:
+            break
+        safe_addstr(stdscr, row, 2, f"{idx}) {job.name} [{job.mode}]")
+        row += 1
+    
+    safe_addstr(stdscr, rows - 2, 0, "번호 입력 (0=취소):")
+    stdscr.refresh()
+    
+    sel = curses_prompt(stdscr, "")
+    if not sel or sel == '0':
+        return None
+    
+    try:
+        idx = int(sel) - 1
+        if 0 <= idx < len(jobs):
+            return idx
+    except ValueError:
+        pass
+    
+    return None
+
+
+def create_job_interactive(stdscr) -> Optional[BackupJob]:
+    """대화형 Job 생성"""
+    name = curses_input_line(stdscr, "Job 이름:")
+    if not name:
+        return None
+    
+    source_str = curses_input_line(stdscr, "Source 경로 (소스 디렉토리):")
+    if not source_str:
+        return None
+    source = Path(source_str).expanduser()
+    
+    dest_str = curses_input_line(stdscr, "Destination 경로 (백업 대상):")
+    if not dest_str:
+        return None
+    destination = Path(dest_str).expanduser()
+    
+    # 모드 선택
+    stdscr.clear()
+    rows, cols = stdscr.getmaxyx()
+    safe_addstr(stdscr, 0, 0, " 백업 모드 선택 ".center(cols, "="))
+    safe_addstr(stdscr, 2, 2, "1) safety_net - 삭제 파일을 SafetyNet으로 이동 (권장)")
+    safe_addstr(stdscr, 3, 2, "2) sync       - 추가/변경만 반영, 삭제 안함")
+    safe_addstr(stdscr, 4, 2, "3) clone      - 완전 미러링 (대상 불필요 파일 삭제)")
+    stdscr.refresh()
+    
+    mode_choice = curses_prompt(stdscr, "선택 [1/2/3]: ")
+    mode_map = {'1': 'safety_net', '2': 'sync', '3': 'clone'}
+    mode = mode_map.get(mode_choice, 'safety_net')
+    
+    # Exclude 패턴
+    excl_str = curses_input_line(stdscr, "제외 패턴 (쉼표 구분, 예: .DS_Store,*.tmp) [Enter=기본값]:")
+    if excl_str:
+        exclude = [x.strip() for x in excl_str.split(",") if x.strip()]
+    else:
+        exclude = [".DS_Store", ".Spotlight-V100", ".fseventsd", "node_modules", ".terraform", "*.tmp"]
+    
+    # SafetyNet 보관일
+    days_str = curses_input_line(stdscr, "SafetyNet 보관일 수 [기본: 30]:", "30")
+    try:
+        safety_net_days = int(days_str)
+    except ValueError:
+        safety_net_days = 30
+    
+    # Verify
+    stdscr.clear()
+    safe_addstr(stdscr, rows // 2, 2, "해시 검증 사용? (느리지만 안전) [y/N]:")
+    stdscr.refresh()
+    ch = stdscr.getch()
+    verify = (ch in (ord('y'), ord('Y')))
+    
+    return BackupJob(
+        name=name,
+        source=source,
+        destination=destination,
+        mode=mode,
+        exclude=exclude,
+        safety_net_days=safety_net_days,
+        verify=verify,
+    )
+
+
+def edit_job_interactive(stdscr, job: BackupJob):
+    """대화형 Job 수정"""
+    def edit_field(label: str, current: str) -> str:
+        value = curses_input_line(stdscr, f"{label} [현재: {current}]:", current)
+        return value if value else current
+    
+    job.name = edit_field("Job 이름", job.name)
+    job.source = Path(edit_field("Source 경로", str(job.source))).expanduser()
+    job.destination = Path(edit_field("Destination 경로", str(job.destination))).expanduser()
+    
+    # 모드 선택
+    rows, cols = stdscr.getmaxyx()
+    stdscr.clear()
+    safe_addstr(stdscr, 0, 0, " 백업 모드 선택 ".center(cols, "="))
+    safe_addstr(stdscr, 2, 2, f"현재: {job.mode}")
+    safe_addstr(stdscr, 3, 2, "1) safety_net 2) sync 3) clone")
+    stdscr.refresh()
+    
+    mode_choice = curses_prompt(stdscr, "선택 [1/2/3, Enter=유지]: ")
+    mode_map = {'1': 'safety_net', '2': 'sync', '3': 'clone'}
+    if mode_choice in mode_map:
+        job.mode = mode_map[mode_choice]
+    
+    excl_str_current = ", ".join(job.exclude) if job.exclude else ""
+    excl_str = edit_field("Exclude 패턴", excl_str_current)
+    if excl_str:
+        job.exclude = [x.strip() for x in excl_str.split(",") if x.strip()]
+    
+    days_str = edit_field("SafetyNet 보관일", str(job.safety_net_days))
+    try:
+        job.safety_net_days = int(days_str)
+    except ValueError:
+        pass
+    
+    stdscr.clear()
+    safe_addstr(stdscr, rows // 2, 2, f"해시 검증 [현재: {'ON' if job.verify else 'OFF'}] [y/n/Enter=유지]:")
+    stdscr.refresh()
+    ch = stdscr.getch()
+    if ch in (ord('y'), ord('Y')):
+        job.verify = True
+    elif ch in (ord('n'), ord('N')):
+        job.verify = False
+
+
+def show_job_details(stdscr, job: BackupJob):
+    """Job 상세 정보 표시"""
+    lines = []
+    lines.append("")
+    lines.append(f"  📦 Job: {job.name}")
+    lines.append(f"  {'─' * 78}")
+    lines.append(f"  모드: {job.mode}")
+    lines.append(f"  소스: {job.source}")
+    lines.append(f"  대상: {job.destination}")
+    lines.append(f"  제외 패턴: {', '.join(job.exclude) if job.exclude else '(없음)'}")
+    lines.append(f"  SafetyNet 보관: {job.safety_net_days}일")
+    lines.append(f"  해시 검증: {'ON' if job.verify else 'OFF'}")
+    lines.append("")
+    
+    # 경로 검증
+    if job.source.exists():
+        lines.append(f"  ✅ 소스 존재: {job.source}")
+    else:
+        lines.append(f"  ❌ 소스 없음: {job.source}")
+    
+    if job.destination.exists():
+        lines.append(f"  ✅ 대상 존재: {job.destination}")
+    else:
+        lines.append(f"  ⚠️  대상 없음 (백업 시 생성됨): {job.destination}")
+    
+    show_text_screen(stdscr, f"Job 상세: {job.name}", lines)
+
+
+def save_config_to_file(stdscr, config_path: Path, jobs: List[BackupJob]) -> bool:
+    """Config를 파일에 저장"""
+    raw = {
+        "jobs": [
+            {
+                "name": j.name,
+                "source": str(j.source),
+                "destination": str(j.destination),
+                "mode": j.mode,
+                "exclude": j.exclude,
+                "safety_net_days": j.safety_net_days,
+                "verify": j.verify,
+            }
+            for j in jobs
+        ]
+    }
+    
+    try:
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = config_path.with_suffix('.tmp')
+        with tmp_path.open("w", encoding="utf-8") as f:
+            json.dump(raw, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, config_path)
+        return True
+    except Exception as e:
+        show_text_screen(stdscr, "저장 실패", [f"오류: {e}"])
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
+        return False
+
+
+def delete_config_curses(stdscr):
+    """Config 삭제"""
+    configs = find_config_files()
+    
+    if not configs:
+        show_text_screen(stdscr, "알림", ["삭제할 Config 파일이 없습니다."])
+        return
+    
+    config_path = interactive_select_config_curses(stdscr)
+    if config_path is None:
+        return
+    
+    # 확인
+    stdscr.clear()
+    rows, cols = stdscr.getmaxyx()
+    safe_addstr(stdscr, rows // 2 - 2, 2, f"⚠️  다음 Config를 삭제하시겠습니까?")
+    safe_addstr(stdscr, rows // 2, 2, f"   {config_path}")
+    safe_addstr(stdscr, rows // 2 + 2, 2, "삭제하려면 'DELETE'를 입력하세요:")
+    stdscr.refresh()
+    
+    confirm = curses_input_line(stdscr, "확인:")
+    if confirm == "DELETE":
+        try:
+            config_path.unlink()
+            show_text_screen(stdscr, "삭제 완료", [f"✅ Config가 삭제되었습니다: {config_path.name}"])
+        except Exception as e:
+            show_text_screen(stdscr, "삭제 실패", [f"오류: {e}"])
+    else:
+        show_text_screen(stdscr, "취소됨", ["삭제가 취소되었습니다."])
+
+
+def create_from_template_curses(stdscr):
+    """템플릿으로부터 Config 생성"""
+    templates = {
+        "1": {
+            "name": "기본 백업 (Safety Net)",
+            "mode": "safety_net",
+            "verify": False,
+            "exclude": [".DS_Store", ".Spotlight-V100", ".fseventsd", "node_modules", ".terraform", "*.tmp"]
+        },
+        "2": {
+            "name": "완전 미러링 (Clone)",
+            "mode": "clone",
+            "verify": True,
+            "exclude": [".DS_Store", "*.tmp"]
+        },
+        "3": {
+            "name": "증분 동기화 (Sync)",
+            "mode": "sync",
+            "verify": False,
+            "exclude": [".DS_Store", "node_modules", "*.log"]
+        }
+    }
+    
+    stdscr.clear()
+    rows, cols = stdscr.getmaxyx()
+    safe_addstr(stdscr, 0, 0, " 📝 템플릿 선택 ".center(cols, "="))
+    
+    row = 2
+    for key, tmpl in templates.items():
+        safe_addstr(stdscr, row, 2, f"{key}) {tmpl['name']}")
+        row += 1
+        safe_addstr(stdscr, row, 5, f"모드: {tmpl['mode']}, 검증: {'ON' if tmpl['verify'] else 'OFF'}")
+        row += 2
+    
+    stdscr.refresh()
+    
+    choice = curses_prompt(stdscr, "선택 [1/2/3, Q=취소]: ")
+    if choice not in templates:
+        return
+    
+    template = templates[choice]
+    
+    # 경로 입력
+    path_str = curses_input_line(stdscr, "Config 파일명 (예: my_backup.json):")
+    if not path_str:
+        return
+    
+    if not path_str.endswith('.json'):
+        path_str += '.json'
+    
+    config_path = Path(path_str).expanduser()
+    
+    name = curses_input_line(stdscr, "Job 이름:", template["name"])
+    source_str = curses_input_line(stdscr, "Source 경로:")
+    if not source_str:
+        return
+    destination_str = curses_input_line(stdscr, "Destination 경로:")
+    if not destination_str:
+        return
+    
+    job = BackupJob(
+        name=name,
+        source=Path(source_str).expanduser(),
+        destination=Path(destination_str).expanduser(),
+        mode=template["mode"],
+        exclude=template["exclude"],
+        safety_net_days=30,
+        verify=template["verify"],
+    )
+    
+    jobs = [job]
+    if save_config_to_file(stdscr, config_path, jobs):
+        show_text_screen(stdscr, "생성 완료", [
+            f"✅ 템플릿 기반 Config가 생성되었습니다!",
+            f"파일: {config_path}",
+            f"Job: {job.name}"
+        ])
+
+
+def validate_config_curses(stdscr):
+    """Config 검증"""
+    configs = find_config_files()
+    
+    if not configs:
+        show_text_screen(stdscr, "알림", ["검증할 Config 파일이 없습니다."])
+        return
+    
+    config_path = interactive_select_config_curses(stdscr)
+    if config_path is None:
+        return
+    
+    lines = []
+    lines.append("")
+    lines.append(f"  ✅ Config 검증: {config_path.name}")
+    lines.append(f"  {'─' * 78}")
+    lines.append("")
+    
+    try:
+        jobs = load_config(config_path)
+        lines.append(f"  ✅ JSON 파싱 성공")
+        lines.append(f"  ✅ Job 로드 성공: {len(jobs)}개")
+        lines.append("")
+        
+        for idx, job in enumerate(jobs, 1):
+            lines.append(f"  [{idx}] {job.name}")
+            
+            # 경로 검증
+            if job.source.exists():
+                lines.append(f"      ✅ 소스 존재")
+            else:
+                lines.append(f"      ❌ 소스 없음: {job.source}")
+            
+            if job.destination.exists():
+                lines.append(f"      ✅ 대상 존재")
+            else:
+                lines.append(f"      ⚠️  대상 없음 (백업 시 생성)")
+            
+            # 모드 검증
+            if job.mode in ("clone", "sync", "safety_net"):
+                lines.append(f"      ✅ 모드 유효: {job.mode}")
+            else:
+                lines.append(f"      ❌ 모드 invalid: {job.mode}")
+            
+            lines.append("")
+        
+        lines.append("  ✅ 전체 검증 완료!")
+        
+    except Exception as e:
+        lines.append(f"  ❌ 검증 실패: {e}")
+    
+    show_text_screen(stdscr, "Config 검증 결과", lines)
 
 
 def interactive_backup_flow_curses(stdscr, base_log_dir: Path, auto_resume_config: dict = None):
@@ -3347,6 +3858,340 @@ def interactive_backup_flow_curses(stdscr, base_log_dir: Path, auto_resume_confi
         import traceback
         logger.error(traceback.format_exc())
         return {"action": "menu"}
+
+
+def show_backup_history_menu(stdscr, base_log_dir: Path):
+    """백업 기록 보기 메뉴"""
+    while True:
+        stdscr.clear()
+        rows, cols = stdscr.getmaxyx()
+        
+        title = " 📊 백업 기록 ".center(cols, "=")
+        safe_addstr(stdscr, 0, 0, title)
+        
+        safe_addstr(stdscr, 2, 2, "백업 작업 기록을 확인할 수 있습니다.")
+        safe_addstr(stdscr, 3, 2, "─" * (cols - 4))
+        
+        menu_row = 5
+        safe_addstr(stdscr, menu_row, 2, "메뉴:")
+        menu_row += 1
+        safe_addstr(stdscr, menu_row, 4, "1) 📋 Journal 목록 (작업 로그)")
+        menu_row += 1
+        safe_addstr(stdscr, menu_row, 4, "2) 📸 Snapshot 목록 (백업 이력)")
+        menu_row += 1
+        safe_addstr(stdscr, menu_row, 4, "3) 📈 백업 통계")
+        menu_row += 2
+        safe_addstr(stdscr, menu_row, 4, "Q) 메인 메뉴로")
+        
+        safe_addstr(stdscr, rows - 1, 0, "[1-3] 메뉴 선택  [Q] 돌아가기")
+        stdscr.refresh()
+        
+        ch = stdscr.getch()
+        
+        if ch in (ord('q'), ord('Q'), 27):
+            break
+        elif ch == ord('1'):
+            try:
+                show_journal_list_screen(stdscr, base_log_dir)
+            except Exception as e:
+                show_text_screen(stdscr, "오류", [f"저널 목록 표시 중 오류: {e}"])
+        elif ch == ord('2'):
+            try:
+                show_snapshot_list_screen(stdscr, base_log_dir)
+            except Exception as e:
+                show_text_screen(stdscr, "오류", [f"스냅샷 목록 표시 중 오류: {e}"])
+        elif ch == ord('3'):
+            try:
+                show_backup_statistics(stdscr, base_log_dir)
+            except Exception as e:
+                show_text_screen(stdscr, "오류", [f"통계 표시 중 오류: {e}"])
+
+
+def show_backup_statistics(stdscr, base_log_dir: Path):
+    """백업 통계 표시"""
+    lines = []
+    lines.append("")
+    lines.append("  📈 백업 통계")
+    lines.append(f"  {'─' * 78}")
+    lines.append("")
+    
+    try:
+        # Journal 통계
+        journals = []
+        for config_dir in base_log_dir.iterdir() if base_log_dir.exists() else []:
+            if config_dir.is_dir():
+                journals_dir = config_dir / "journals"
+                if journals_dir.exists():
+                    journals.extend(journals_dir.glob("journal_*.json"))
+        
+        total_journals = len(journals)
+        success_count = 0
+        failed_count = 0
+        cancelled_count = 0
+        
+        for j in journals:
+            try:
+                data = load_journal(j)
+                if data.status == "success":
+                    success_count += 1
+                elif data.status == "cancelled":
+                    cancelled_count += 1
+                else:
+                    failed_count += 1
+            except:
+                pass
+        
+        lines.append(f"  📋 Journal 통계:")
+        lines.append(f"     전체: {total_journals:,}개")
+        lines.append(f"     ✅ 성공: {success_count:,}개 ({success_count*100//total_journals if total_journals else 0}%)")
+        lines.append(f"     ⚠️  취소: {cancelled_count:,}개 ({cancelled_count*100//total_journals if total_journals else 0}%)")
+        lines.append(f"     ❌ 실패: {failed_count:,}개 ({failed_count*100//total_journals if total_journals else 0}%)")
+        lines.append("")
+        
+        # Snapshot 통계
+        total_snapshots = 0
+        total_files = 0
+        
+        for config_dir in base_log_dir.iterdir() if base_log_dir.exists() else []:
+            if config_dir.is_dir():
+                snapshots_root = config_dir / "snapshots"
+                if snapshots_root.exists():
+                    for job_dir in snapshots_root.iterdir():
+                        if job_dir.is_dir():
+                            index_file = job_dir / "index.json"
+                            if index_file.exists():
+                                try:
+                                    with index_file.open("r") as f:
+                                        index = json.load(f)
+                                    total_snapshots += len(index)
+                                    for entry in index:
+                                        total_files += entry.get('file_count', 0)
+                                except:
+                                    pass
+        
+        lines.append(f"  📸 Snapshot 통계:")
+        lines.append(f"     전체 스냅샷: {total_snapshots:,}개")
+        lines.append(f"     백업된 파일: {total_files:,}개")
+        lines.append("")
+        
+        # Config 통계
+        configs = find_config_files()
+        lines.append(f"  ⚙️  Config 통계:")
+        lines.append(f"     전체 Config: {len(configs):,}개")
+        
+        total_jobs = 0
+        for cfg in configs:
+            try:
+                jobs = load_config(cfg)
+                total_jobs += len(jobs)
+            except:
+                pass
+        
+        lines.append(f"     전체 Job: {total_jobs:,}개")
+        lines.append("")
+        
+    except Exception as e:
+        lines.append(f"  ❌ 통계 수집 실패: {e}")
+    
+    show_text_screen(stdscr, "📈 백업 통계", lines)
+
+
+def show_advanced_tools_menu(stdscr, base_log_dir: Path):
+    """고급 도구 메뉴"""
+    while True:
+        stdscr.clear()
+        rows, cols = stdscr.getmaxyx()
+        
+        title = " 🔧 고급 도구 ".center(cols, "=")
+        safe_addstr(stdscr, 0, 0, title)
+        
+        safe_addstr(stdscr, 2, 2, "⚠️  주의: 이 도구들은 고급 사용자용입니다.")
+        safe_addstr(stdscr, 3, 2, "    잘못 사용하면 데이터 손상이 발생할 수 있습니다.")
+        safe_addstr(stdscr, 4, 2, "─" * (cols - 4))
+        
+        menu_row = 6
+        safe_addstr(stdscr, menu_row, 2, "도구:")
+        menu_row += 1
+        safe_addstr(stdscr, menu_row, 4, "1) 🔄 최근 Journal 롤백")
+        menu_row += 1
+        safe_addstr(stdscr, menu_row, 4, "2) 🗑️  SafetyNet 정리")
+        menu_row += 1
+        safe_addstr(stdscr, menu_row, 4, "3) 🧹 로그 파일 정리")
+        menu_row += 1
+        safe_addstr(stdscr, menu_row, 4, "4) 🔍 Journal 상세 분석")
+        menu_row += 2
+        safe_addstr(stdscr, menu_row, 4, "Q) 메인 메뉴로")
+        
+        safe_addstr(stdscr, rows - 1, 0, "[1-4] 메뉴 선택  [Q] 돌아가기")
+        stdscr.refresh()
+        
+        ch = stdscr.getch()
+        
+        if ch in (ord('q'), ord('Q'), 27):
+            break
+        elif ch == ord('1'):
+            # 롤백
+            try:
+                interactive_latest_rollback_curses(stdscr, base_log_dir)
+            except Exception as e:
+                show_text_screen(stdscr, "오류", [f"롤백 중 오류: {e}"])
+        elif ch == ord('2'):
+            # SafetyNet 정리
+            try:
+                cleanup_safetynet_curses(stdscr)
+            except Exception as e:
+                show_text_screen(stdscr, "오류", [f"SafetyNet 정리 중 오류: {e}"])
+        elif ch == ord('3'):
+            # 로그 정리
+            try:
+                cleanup_logs_curses(stdscr, base_log_dir)
+            except Exception as e:
+                show_text_screen(stdscr, "오류", [f"로그 정리 중 오류: {e}"])
+        elif ch == ord('4'):
+            # Journal 분석
+            try:
+                analyze_journal_curses(stdscr, base_log_dir)
+            except Exception as e:
+                show_text_screen(stdscr, "오류", [f"Journal 분석 중 오류: {e}"])
+
+
+def cleanup_safetynet_curses(stdscr):
+    """SafetyNet 정리"""
+    lines = []
+    lines.append("")
+    lines.append("  🗑️  SafetyNet 정리 기능")
+    lines.append(f"  {'─' * 78}")
+    lines.append("")
+    lines.append("  SafetyNet 폴더의 오래된 파일을 삭제합니다.")
+    lines.append("")
+    lines.append("  ⚠️  이 작업은 구현 예정입니다.")
+    lines.append("     현재는 수동으로 .SafetyNet 폴더를 정리하세요.")
+    lines.append("")
+    
+    show_text_screen(stdscr, "SafetyNet 정리", lines)
+
+
+def cleanup_logs_curses(stdscr, base_log_dir: Path):
+    """로그 정리"""
+    lines = []
+    lines.append("")
+    lines.append("  🧹 로그 파일 정리")
+    lines.append(f"  {'─' * 78}")
+    lines.append("")
+    
+    try:
+        # 30일 이상 된 로그 파일 찾기
+        from datetime import timedelta
+        cutoff_date = datetime.now() - timedelta(days=30)
+        
+        old_logs = []
+        for log_file in base_log_dir.glob("disk_sync_pro_*.log"):
+            try:
+                mtime = datetime.fromtimestamp(log_file.stat().st_mtime)
+                if mtime < cutoff_date:
+                    old_logs.append((log_file, mtime))
+            except:
+                pass
+        
+        if not old_logs:
+            lines.append("  ✅ 정리할 로그 파일이 없습니다.")
+            lines.append(f"     (30일 이내 파일만 보관됨)")
+        else:
+            lines.append(f"  발견된 오래된 로그: {len(old_logs)}개")
+            lines.append("")
+            for log_file, mtime in old_logs[:10]:
+                lines.append(f"    - {log_file.name} ({mtime.strftime('%Y-%m-%d')})")
+            
+            if len(old_logs) > 10:
+                lines.append(f"    ... 외 {len(old_logs) - 10}개")
+            
+            lines.append("")
+            lines.append("  ⚠️  자동 정리 기능이 활성화되어 있습니다.")
+            lines.append("     백업 실행 시 자동으로 정리됩니다.")
+    
+    except Exception as e:
+        lines.append(f"  ❌ 로그 확인 실패: {e}")
+    
+    show_text_screen(stdscr, "로그 정리", lines)
+
+
+def analyze_journal_curses(stdscr, base_log_dir: Path):
+    """Journal 분석"""
+    # Journal 선택
+    journals = []
+    for config_dir in base_log_dir.iterdir() if base_log_dir.exists() else []:
+        if config_dir.is_dir():
+            journals_dir = config_dir / "journals"
+            if journals_dir.exists():
+                journals.extend(journals_dir.glob("journal_*.json"))
+    
+    journals = sorted(journals, key=lambda p: p.stat().st_mtime, reverse=True)[:20]
+    
+    if not journals:
+        show_text_screen(stdscr, "Journal 분석", ["", "  ⚠️  분석할 Journal이 없습니다.", ""])
+        return
+    
+    stdscr.clear()
+    rows, cols = stdscr.getmaxyx()
+    safe_addstr(stdscr, 0, 0, " Journal 선택 ".center(cols, "="))
+    
+    row = 2
+    for idx, j in enumerate(journals[:10], 1):
+        if row >= rows - 3:
+            break
+        safe_addstr(stdscr, row, 2, f"{idx}) {j.name}")
+        row += 1
+    
+    safe_addstr(stdscr, rows - 2, 0, "번호 입력 (0=취소):")
+    stdscr.refresh()
+    
+    sel = curses_prompt(stdscr, "")
+    if not sel or sel == '0':
+        return
+    
+    try:
+        idx = int(sel) - 1
+        if 0 <= idx < len(journals):
+            journal_path = journals[idx]
+        else:
+            return
+    except ValueError:
+        return
+    
+    # Journal 분석
+    lines = []
+    lines.append("")
+    lines.append(f"  🔍 Journal 분석: {journal_path.name}")
+    lines.append(f"  {'─' * 78}")
+    lines.append("")
+    
+    try:
+        journal = load_journal(journal_path)
+        
+        lines.append(f"  Job: {journal.job_name}")
+        lines.append(f"  시간: {journal.timestamp}")
+        lines.append(f"  상태: {journal.status}")
+        lines.append(f"  대상: {journal.dest_root}")
+        lines.append(f"  롤백 위치: {journal.rollback_root}")
+        lines.append("")
+        lines.append(f"  📊 작업 통계:")
+        lines.append(f"     전체 작업: {len(journal.ops):,}개")
+        
+        # 작업 타입별 집계
+        ops_by_type = {}
+        for op in journal.ops:
+            ops_by_type[op.action] = ops_by_type.get(op.action, 0) + 1
+        
+        for action, count in sorted(ops_by_type.items()):
+            lines.append(f"     - {action}: {count:,}개")
+        
+        lines.append("")
+        lines.append(f"  💾 파일 크기: {journal_path.stat().st_size / 1024:.1f} KB")
+        
+    except Exception as e:
+        lines.append(f"  ❌ 분석 실패: {e}")
+    
+    show_text_screen(stdscr, "Journal 분석", lines)
 
 
 def interactive_latest_rollback_curses(stdscr, base_log_dir: Path):
@@ -3445,11 +4290,10 @@ def interactive_main_curses(stdscr):
             ("", 0),
             ("메뉴를 선택하세요:", 0),
             ("", 0),
-            ("1) config 선택 후 백업 실행", 2),
-            ("2) 가장 최근 Job 저널로 롤백 실행", 2),
-            ("3) journal_*.json 목록 보기", 2),
-            ("4) snapshots/ 목록 보기", 2),
-            ("5) config JSON 생성/수정", 2),
+            ("1) 🚀 백업 실행", 2),
+            ("2) ⚙️  Config 관리", 2),
+            ("3) 📊 백업 기록 보기", 2),
+            ("4) 🔧 고급 도구", 2),
         ]
         
         # Resume 가능한 Job이 있으면 표시
@@ -3474,7 +4318,7 @@ def interactive_main_curses(stdscr):
             row += 1
 
         # 하단 안내
-        help_line = "[1-5] 메뉴 선택  [Q] 종료  [ESC] 뒤로가기"
+        help_line = "[1-4] 메뉴 선택  [Q] 종료  [ESC] 뒤로가기"
         safe_addstr(stdscr, rows - 1, (cols - len(help_line)) // 2, help_line)
 
         stdscr.refresh()
@@ -3488,30 +4332,27 @@ def interactive_main_curses(stdscr):
         if ch in (ord('q'), ord('Q'), 27):  # Q 또는 ESC
             break
         elif ch == ord('1'):
+            # 🚀 백업 실행
             try:
-                # 백업 실행 루프
                 auto_resume_cfg = None
                 
                 while True:
                     result = interactive_backup_flow_curses(stdscr, base_log_dir, auto_resume_cfg)
                     
-                    # 결과 없으면 메뉴로
                     if not result:
                         break
                     
                     action = result.get("action", "menu")
                     
                     if action == "resume":
-                        # Resume 설정 저장하고 다시 루프
                         auto_resume_cfg = {
                             "config_path": result["config_path"],
                             "job_name": result["job_name"]
                         }
-                        continue  # 루프 계속 - auto_resume_cfg로 재실행
+                        continue
                     elif action == "quit":
-                        return  # 프로그램 종료
+                        return
                     else:
-                        # menu 또는 기타
                         break
             except Exception as e:
                 import traceback
@@ -3522,25 +4363,23 @@ def interactive_main_curses(stdscr):
                     traceback.format_exc()
                 ])
         elif ch == ord('2'):
+            # ⚙️ Config 관리
             try:
-                interactive_latest_rollback_curses(stdscr, base_log_dir)
+                show_config_manager_main_menu(stdscr)
             except Exception as e:
-                show_text_screen(stdscr, "오류", [f"롤백 중 오류: {e}"])
+                show_text_screen(stdscr, "오류", [f"Config 관리 중 오류: {e}"])
         elif ch == ord('3'):
+            # 📊 백업 기록 보기
             try:
-                show_journal_list_screen(stdscr, base_log_dir)
+                show_backup_history_menu(stdscr, base_log_dir)
             except Exception as e:
-                show_text_screen(stdscr, "오류", [f"저널 목록 표시 중 오류: {e}"])
+                show_text_screen(stdscr, "오류", [f"백업 기록 표시 중 오류: {e}"])
         elif ch == ord('4'):
+            # 🔧 고급 도구
             try:
-                show_snapshot_list_screen(stdscr, base_log_dir)
+                show_advanced_tools_menu(stdscr, base_log_dir)
             except Exception as e:
-                show_text_screen(stdscr, "오류", [f"스냅샷 목록 표시 중 오류: {e}"])
-        elif ch == ord('5'):
-            try:
-                interactive_config_editor_curses(stdscr)
-            except Exception as e:
-                show_text_screen(stdscr, "오류", [f"설정 편집 중 오류: {e}"])
+                show_text_screen(stdscr, "오류", [f"고급 도구 중 오류: {e}"])
         
         # 잠시 대기 (키 중복 입력 방지)
         try:
@@ -3552,6 +4391,522 @@ def interactive_main_curses(stdscr):
             pass
 
 
+# ================ 텍스트 모드 Config 관리 =================
+
+def config_manager_plain_menu():
+    """텍스트 모드 Config 관리 메뉴"""
+    while True:
+        print("\n" + "=" * 60)
+        print(" ⚙️  Config 관리 (CRUD) ".center(60))
+        print("=" * 60)
+        
+        configs = find_config_files()
+        print(f"📁 발견된 Config 파일: {len(configs)}개\n")
+        
+        print("1) 📋 Config 목록 보기")
+        print("2) ➕ 새 Config 생성")
+        print("3) ✏️  Config 수정")
+        print("4) 🗑️  Config 삭제")
+        print("5) 📝 템플릿으로 생성")
+        print("6) ✅ Config 검증")
+        print("Q) 메인 메뉴로")
+        
+        choice = input("\n선택> ").strip().lower()
+        
+        if choice == 'q':
+            break
+        elif choice == '1':
+            show_config_list_plain()
+        elif choice == '2':
+            create_new_config_plain()
+        elif choice == '3':
+            update_config_plain()
+        elif choice == '4':
+            delete_config_plain()
+        elif choice == '5':
+            create_from_template_plain()
+        elif choice == '6':
+            validate_config_plain()
+
+
+def show_config_list_plain():
+    """Config 목록 보기 (텍스트)"""
+    configs = find_config_files()
+    
+    print("\n" + "=" * 60)
+    print(" 📋 Config 목록 ".center(60))
+    print("=" * 60)
+    
+    if not configs:
+        print("\n⚠️  Config 파일이 없습니다.\n")
+        input("계속하려면 Enter...")
+        return
+    
+    for idx, config_path in enumerate(configs, 1):
+        print(f"\n[{idx}] 📄 {config_path.name}")
+        print(f"경로: {config_path}")
+        
+        try:
+            jobs = load_config(config_path)
+            print(f"Job 수: {len(jobs)}")
+            
+            for job_idx, job in enumerate(jobs[:3], 1):
+                print(f"  [{job_idx}] {job.name} [{job.mode}]")
+                print(f"      src: {job.source}")
+                print(f"      dst: {job.destination}")
+            
+            if len(jobs) > 3:
+                print(f"  ... 외 {len(jobs) - 3}개 Job")
+        except Exception as e:
+            print(f"❌ 로드 실패: {e}")
+        print("-" * 60)
+    
+    input("\n계속하려면 Enter...")
+
+
+def create_new_config_plain():
+    """새 Config 생성 (텍스트)"""
+    print("\n" + "=" * 60)
+    print(" ➕ 새 Config 생성 ".center(60))
+    print("=" * 60)
+    
+    path_str = input("\nConfig 파일명 (예: my_backup.json): ").strip()
+    if not path_str:
+        return
+    
+    if not path_str.endswith('.json'):
+        path_str += '.json'
+    
+    config_path = Path(path_str).expanduser()
+    
+    if config_path.exists():
+        confirm = input(f"\n⚠️  파일이 이미 존재합니다. 덮어쓰시겠습니까? [y/N]: ").strip().lower()
+        if confirm != 'y':
+            return
+    
+    jobs = []
+    manage_jobs_plain(config_path, jobs)
+
+
+def update_config_plain():
+    """Config 수정 (텍스트)"""
+    configs = find_config_files()
+    
+    if not configs:
+        print("\n⚠️  수정할 Config 파일이 없습니다.")
+        input("계속하려면 Enter...")
+        return
+    
+    print("\n" + "=" * 60)
+    print(" Config 선택 ".center(60))
+    print("=" * 60)
+    
+    for idx, cfg in enumerate(configs, 1):
+        print(f"{idx}) {cfg}")
+    
+    sel = input("\n번호 선택 (0=취소): ").strip()
+    try:
+        idx = int(sel) - 1
+        if 0 <= idx < len(configs):
+            config_path = configs[idx]
+        else:
+            return
+    except ValueError:
+        return
+    
+    try:
+        jobs = load_config(config_path)
+    except Exception as e:
+        print(f"\n❌ Config 읽기 실패: {e}")
+        input("계속하려면 Enter...")
+        return
+    
+    manage_jobs_plain(config_path, jobs)
+
+
+def manage_jobs_plain(config_path: Path, jobs: List[BackupJob]):
+    """Job 관리 (텍스트)"""
+    while True:
+        print("\n" + "=" * 60)
+        print(f" Config 편집: {config_path.name} ".center(60))
+        print("=" * 60)
+        print(f"\n📦 현재 Job 수: {len(jobs)}개\n")
+        
+        if jobs:
+            for idx, job in enumerate(jobs, 1):
+                print(f"{idx}) {job.name} [{job.mode}]")
+                print(f"   src: {job.source}")
+                print(f"   dst: {job.destination}")
+        else:
+            print("⚠️  Job이 없습니다.\n")
+        
+        print("\n작업:")
+        print("A) ➕ Job 추가")
+        print("E) ✏️  Job 수정")
+        print("D) 🗑️  Job 삭제")
+        print("C) 📋 Job 복제")
+        print("V) 👁️  Job 상세 보기")
+        print("S) 💾 저장 후 종료")
+        print("Q) 저장 않고 종료")
+        
+        choice = input("\n선택> ").strip().lower()
+        
+        if choice == 'q':
+            confirm = input("저장하지 않고 종료하시겠습니까? [y/N]: ").strip().lower()
+            if confirm == 'y':
+                break
+        elif choice == 's':
+            if save_config_plain(config_path, jobs):
+                print("\n✅ Config가 성공적으로 저장되었습니다.")
+                input("계속하려면 Enter...")
+                break
+        elif choice == 'a':
+            new_job = create_job_plain()
+            if new_job:
+                jobs.append(new_job)
+                print("\n✅ Job이 추가되었습니다.")
+        elif choice == 'e':
+            if not jobs:
+                print("\n⚠️  수정할 Job이 없습니다.")
+                input("계속하려면 Enter...")
+                continue
+            job_idx = select_job_plain(jobs, "수정할 Job 선택")
+            if job_idx is not None:
+                edit_job_plain(jobs[job_idx])
+        elif choice == 'd':
+            if not jobs:
+                print("\n⚠️  삭제할 Job이 없습니다.")
+                input("계속하려면 Enter...")
+                continue
+            job_idx = select_job_plain(jobs, "삭제할 Job 선택")
+            if job_idx is not None:
+                confirm = input(f"\n'{jobs[job_idx].name}' Job을 삭제하시겠습니까? [y/N]: ").strip().lower()
+                if confirm == 'y':
+                    jobs.pop(job_idx)
+                    print("\n✅ Job이 삭제되었습니다.")
+        elif choice == 'c':
+            if not jobs:
+                print("\n⚠️  복제할 Job이 없습니다.")
+                input("계속하려면 Enter...")
+                continue
+            job_idx = select_job_plain(jobs, "복제할 Job 선택")
+            if job_idx is not None:
+                original = jobs[job_idx]
+                new_job = BackupJob(
+                    name=f"{original.name}_copy",
+                    source=original.source,
+                    destination=original.destination,
+                    mode=original.mode,
+                    exclude=original.exclude.copy(),
+                    safety_net_days=original.safety_net_days,
+                    verify=original.verify,
+                )
+                jobs.append(new_job)
+                print(f"\n✅ '{new_job.name}' Job이 복제되었습니다.")
+        elif choice == 'v':
+            if not jobs:
+                print("\n⚠️  보기할 Job이 없습니다.")
+                input("계속하려면 Enter...")
+                continue
+            job_idx = select_job_plain(jobs, "상세 보기할 Job 선택")
+            if job_idx is not None:
+                show_job_details_plain(jobs[job_idx])
+
+
+def select_job_plain(jobs: List[BackupJob], title: str) -> Optional[int]:
+    """Job 선택 (텍스트)"""
+    print(f"\n{title}")
+    for idx, job in enumerate(jobs, 1):
+        print(f"{idx}) {job.name} [{job.mode}]")
+    
+    sel = input("\n번호 입력 (0=취소): ").strip()
+    try:
+        idx = int(sel) - 1
+        if 0 <= idx < len(jobs):
+            return idx
+    except ValueError:
+        pass
+    return None
+
+
+def create_job_plain() -> Optional[BackupJob]:
+    """Job 생성 (텍스트)"""
+    print("\n" + "=" * 60)
+    print(" ➕ 새 Job 추가 ".center(60))
+    print("=" * 60)
+    
+    name = input("\nJob 이름: ").strip()
+    if not name:
+        return None
+    
+    source = input("Source 경로: ").strip()
+    if not source:
+        return None
+    
+    destination = input("Destination 경로: ").strip()
+    if not destination:
+        return None
+    
+    print("\n백업 모드:")
+    print("1) safety_net - 삭제 파일을 SafetyNet으로 이동 (권장)")
+    print("2) sync       - 추가/변경만, 삭제 안함")
+    print("3) clone      - 완전 미러링")
+    mode_choice = input("선택 [1/2/3]: ").strip()
+    mode_map = {'1': 'safety_net', '2': 'sync', '3': 'clone'}
+    mode = mode_map.get(mode_choice, 'safety_net')
+    
+    excl = input("\n제외 패턴 (쉼표 구분, Enter=기본값): ").strip()
+    if excl:
+        exclude = [x.strip() for x in excl.split(",") if x.strip()]
+    else:
+        exclude = [".DS_Store", ".Spotlight-V100", ".fseventsd", "node_modules", ".terraform", "*.tmp"]
+    
+    days = input("SafetyNet 보관일 [30]: ").strip()
+    safety_net_days = int(days) if days else 30
+    
+    verify = input("해시 검증 사용? [y/N]: ").strip().lower() == 'y'
+    
+    return BackupJob(
+        name=name,
+        source=Path(source).expanduser(),
+        destination=Path(destination).expanduser(),
+        mode=mode,
+        exclude=exclude,
+        safety_net_days=safety_net_days,
+        verify=verify,
+    )
+
+
+def edit_job_plain(job: BackupJob):
+    """Job 수정 (텍스트)"""
+    print(f"\n=== Job 수정: {job.name} ===")
+    
+    name = input(f"Job 이름 [{job.name}]: ").strip()
+    if name:
+        job.name = name
+    
+    source = input(f"Source [{job.source}]: ").strip()
+    if source:
+        job.source = Path(source).expanduser()
+    
+    dest = input(f"Destination [{job.destination}]: ").strip()
+    if dest:
+        job.destination = Path(dest).expanduser()
+    
+    print(f"현재 모드: {job.mode}")
+    print("1) safety_net 2) sync 3) clone")
+    mode_choice = input("변경 [Enter=유지]: ").strip()
+    mode_map = {'1': 'safety_net', '2': 'sync', '3': 'clone'}
+    if mode_choice in mode_map:
+        job.mode = mode_map[mode_choice]
+    
+    print("\n✅ Job이 수정되었습니다.")
+
+
+def show_job_details_plain(job: BackupJob):
+    """Job 상세 정보 (텍스트)"""
+    print("\n" + "=" * 60)
+    print(f" 📦 Job: {job.name} ".center(60))
+    print("=" * 60)
+    print(f"모드: {job.mode}")
+    print(f"소스: {job.source}")
+    print(f"대상: {job.destination}")
+    print(f"제외: {', '.join(job.exclude) if job.exclude else '(없음)'}")
+    print(f"SafetyNet: {job.safety_net_days}일")
+    print(f"해시 검증: {'ON' if job.verify else 'OFF'}")
+    
+    if job.source.exists():
+        print(f"\n✅ 소스 존재")
+    else:
+        print(f"\n❌ 소스 없음")
+    
+    if job.destination.exists():
+        print(f"✅ 대상 존재")
+    else:
+        print(f"⚠️  대상 없음 (백업 시 생성)")
+    
+    input("\n계속하려면 Enter...")
+
+
+def save_config_plain(config_path: Path, jobs: List[BackupJob]) -> bool:
+    """Config 저장 (텍스트)"""
+    raw = {
+        "jobs": [
+            {
+                "name": j.name,
+                "source": str(j.source),
+                "destination": str(j.destination),
+                "mode": j.mode,
+                "exclude": j.exclude,
+                "safety_net_days": j.safety_net_days,
+                "verify": j.verify,
+            }
+            for j in jobs
+        ]
+    }
+    
+    try:
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = config_path.with_suffix('.tmp')
+        with tmp_path.open("w", encoding="utf-8") as f:
+            json.dump(raw, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, config_path)
+        return True
+    except Exception as e:
+        print(f"\n❌ 저장 실패: {e}")
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
+        return False
+
+
+def delete_config_plain():
+    """Config 삭제 (텍스트)"""
+    configs = find_config_files()
+    
+    if not configs:
+        print("\n⚠️  삭제할 Config 파일이 없습니다.")
+        input("계속하려면 Enter...")
+        return
+    
+    print("\n" + "=" * 60)
+    print(" Config 선택 ".center(60))
+    print("=" * 60)
+    
+    for idx, cfg in enumerate(configs, 1):
+        print(f"{idx}) {cfg}")
+    
+    sel = input("\n번호 선택 (0=취소): ").strip()
+    try:
+        idx = int(sel) - 1
+        if 0 <= idx < len(configs):
+            config_path = configs[idx]
+        else:
+            return
+    except ValueError:
+        return
+    
+    print(f"\n⚠️  다음 Config를 삭제하시겠습니까?")
+    print(f"   {config_path}")
+    confirm = input("\n삭제하려면 'DELETE'를 입력: ").strip()
+    
+    if confirm == "DELETE":
+        try:
+            config_path.unlink()
+            print("\n✅ Config가 삭제되었습니다.")
+        except Exception as e:
+            print(f"\n❌ 삭제 실패: {e}")
+    else:
+        print("\n취소되었습니다.")
+    
+    input("계속하려면 Enter...")
+
+
+def create_from_template_plain():
+    """템플릿으로 Config 생성 (텍스트)"""
+    print("\n" + "=" * 60)
+    print(" 📝 템플릿 선택 ".center(60))
+    print("=" * 60)
+    
+    print("\n1) 기본 백업 (Safety Net)")
+    print("2) 완전 미러링 (Clone)")
+    print("3) 증분 동기화 (Sync)")
+    
+    choice = input("\n선택 [1/2/3]: ").strip()
+    
+    templates = {
+        "1": ("safety_net", False, [".DS_Store", ".fseventsd", "node_modules", "*.tmp"]),
+        "2": ("clone", True, [".DS_Store", "*.tmp"]),
+        "3": ("sync", False, [".DS_Store", "node_modules", "*.log"])
+    }
+    
+    if choice not in templates:
+        return
+    
+    mode, verify, exclude = templates[choice]
+    
+    path = input("\nConfig 파일명: ").strip()
+    if not path:
+        return
+    if not path.endswith('.json'):
+        path += '.json'
+    
+    name = input("Job 이름: ").strip()
+    source = input("Source 경로: ").strip()
+    destination = input("Destination 경로: ").strip()
+    
+    if not (name and source and destination):
+        return
+    
+    job = BackupJob(
+        name=name,
+        source=Path(source).expanduser(),
+        destination=Path(destination).expanduser(),
+        mode=mode,
+        exclude=exclude,
+        safety_net_days=30,
+        verify=verify,
+    )
+    
+    config_path = Path(path).expanduser()
+    if save_config_plain(config_path, [job]):
+        print(f"\n✅ 템플릿 기반 Config가 생성되었습니다!")
+        input("계속하려면 Enter...")
+
+
+def validate_config_plain():
+    """Config 검증 (텍스트)"""
+    configs = find_config_files()
+    
+    if not configs:
+        print("\n⚠️  검증할 Config 파일이 없습니다.")
+        input("계속하려면 Enter...")
+        return
+    
+    print("\n" + "=" * 60)
+    print(" Config 선택 ".center(60))
+    print("=" * 60)
+    
+    for idx, cfg in enumerate(configs, 1):
+        print(f"{idx}) {cfg}")
+    
+    sel = input("\n번호 선택 (0=취소): ").strip()
+    try:
+        idx = int(sel) - 1
+        if 0 <= idx < len(configs):
+            config_path = configs[idx]
+        else:
+            return
+    except ValueError:
+        return
+    
+    print("\n" + "=" * 60)
+    print(f" ✅ Config 검증: {config_path.name} ".center(60))
+    print("=" * 60)
+    
+    try:
+        jobs = load_config(config_path)
+        print(f"\n✅ JSON 파싱 성공")
+        print(f"✅ Job 로드 성공: {len(jobs)}개\n")
+        
+        for idx, job in enumerate(jobs, 1):
+            print(f"[{idx}] {job.name}")
+            print(f"    소스: {'✅ 존재' if job.source.exists() else '❌ 없음'}")
+            print(f"    대상: {'✅ 존재' if job.destination.exists() else '⚠️  없음 (생성예정)'}")
+            print(f"    모드: {job.mode}")
+            print()
+        
+        print("✅ 전체 검증 완료!")
+    except Exception as e:
+        print(f"\n❌ 검증 실패: {e}")
+    
+    input("\n계속하려면 Enter...")
+
+
 # ================ 텍스트 모드 메인 메뉴 (curses 불가 시) =================
 
 def interactive_main_plain():
@@ -3560,13 +4915,12 @@ def interactive_main_plain():
 
     while True:
         print("=" * 60)
-        print(" DiskSyncPro - Main Menu (no curses) ".center(60))
+        print(" DiskSyncPro - Main Menu ".center(60))
         print("=" * 60)
-        print("1) config 선택 후 백업 실행")
-        print("2) 가장 최근 Job 저널로 롤백 실행")
-        print("3) journal_*.json 목록 보기")
-        print("4) snapshots/ 목록 보기")
-        print("5) config JSON 생성/수정")
+        print("1) 🚀 백업 실행")
+        print("2) ⚙️  Config 관리")
+        print("3) 📊 백업 기록 보기")
+        print("4) 🔧 고급 도구")
         print("Q) 종료")
         choice = input("> ").strip().lower()
 
@@ -3636,38 +4990,64 @@ def interactive_main_plain():
             input("백업이 종료되었습니다. Enter 를 누르면 메인 메뉴로 돌아갑니다.")
 
         elif choice == '2':
-            latest = get_latest_journal(base_log_dir)
-            if not latest:
-                print("최근 저널 파일을 찾을 수 없습니다.")
-                input("계속하려면 Enter...")
-                continue
-            j = load_journal(latest)
-            print(f"최근 저널: {latest.name}")
-            print(f"job={j.job_name}, ts={j.timestamp}, status={j.status}")
-            yn = input("이 저널로 롤백할까요? [y/N]: ").strip().lower()
-            if yn == 'y':
-                rollback_journal(j, dry_run=False)
-                j.status = "rolled_back"
-                save_journal(j, latest)
-                print("롤백 완료.")
-            else:
-                print("롤백 취소.")
-            input("계속하려면 Enter...")
+            # ⚙️ Config 관리
+            config_manager_plain_menu()
 
         elif choice == '3':
-            journals = sorted(base_log_dir.glob("journal_*.json"))
-            if not journals:
-                print("journal_*.json 파일이 없습니다.")
-            else:
-                for j in journals[-100:]:
-                    data = load_journal(j)
-                    print(f"{j.name} | job={data.job_name} | ts={data.timestamp} | status={data.status}")
-            input("계속하려면 Enter...")
+            # 📊 백업 기록 보기
+            backup_history_plain_menu(base_log_dir)
 
         elif choice == '4':
-            # config별로 스냅샷 표시
+            # 🔧 고급 도구
+            advanced_tools_plain_menu(base_log_dir)
+
+        else:
+            continue
+
+
+def backup_history_plain_menu(base_log_dir: Path):
+    """백업 기록 메뉴 (텍스트)"""
+    while True:
+        print("\n" + "=" * 60)
+        print(" 📊 백업 기록 ".center(60))
+        print("=" * 60)
+        print("\n1) 📋 Journal 목록 (작업 로그)")
+        print("2) 📸 Snapshot 목록 (백업 이력)")
+        print("Q) 메인 메뉴로")
+        
+        choice = input("\n선택> ").strip().lower()
+        
+        if choice == 'q':
+            break
+        elif choice == '1':
+            # Journal 목록
+            journals = []
+            for config_dir in base_log_dir.iterdir() if base_log_dir.exists() else []:
+                if config_dir.is_dir():
+                    journals_dir = config_dir / "journals"
+                    if journals_dir.exists():
+                        journals.extend(journals_dir.glob("journal_*.json"))
+            
+            journals = sorted(journals)
+            
+            if not journals:
+                print("\n⚠️  journal 파일이 없습니다.")
+            else:
+                print("\n" + "=" * 60)
+                print(f" Journal 목록 (최근 100개) ".center(60))
+                print("=" * 60)
+                for j in journals[-100:]:
+                    try:
+                        data = load_journal(j)
+                        print(f"{j.name} | job={data.job_name} | ts={data.timestamp} | status={data.status}")
+                    except:
+                        print(f"{j.name} | (읽기 실패)")
+            input("\n계속하려면 Enter...")
+        
+        elif choice == '2':
+            # Snapshot 목록
             config_found = False
-            for config_dir in sorted(base_log_dir.iterdir()):
+            for config_dir in sorted(base_log_dir.iterdir()) if base_log_dir.exists() else []:
                 if not config_dir.is_dir():
                     continue
                 snapshots_root = config_dir / "snapshots"
@@ -3686,152 +5066,95 @@ def interactive_main_plain():
                     if not index_file.exists():
                         print(f"  [{job_dir.name}] index.json 없음")
                         continue
-                    with index_file.open("r", encoding="utf-8") as f:
-                        index = json.load(f)
-                    print(f"\n  Job: {job_dir.name} (snapshots: {len(index)})")
-                    for entry in index[-5:]:
-                        print(
-                            f"    ts={entry.get('timestamp')} | count={entry.get('file_count'):,}"
-                        )
+                    try:
+                        with index_file.open("r", encoding="utf-8") as f:
+                            index = json.load(f)
+                        print(f"\n  Job: {job_dir.name} (snapshots: {len(index)})")
+                        for entry in index[-5:]:
+                            print(
+                                f"    ts={entry.get('timestamp')} | count={entry.get('file_count'):,}"
+                            )
+                    except:
+                        print(f"  [{job_dir.name}] 읽기 실패")
             
             if not config_found:
-                print("snapshots 디렉토리가 없습니다.")
+                print("\n⚠️  snapshots 디렉토리가 없습니다.")
             input("\n계속하려면 Enter...")
 
-        elif choice == '5':
-            print("기존 config 수정(E), 새 config 생성(N), 취소(Q)")
-            sub = input("> ").strip().lower()
-            if sub == 'q' or not sub:
+
+def advanced_tools_plain_menu(base_log_dir: Path):
+    """고급 도구 메뉴 (텍스트)"""
+    while True:
+        print("\n" + "=" * 60)
+        print(" 🔧 고급 도구 ".center(60))
+        print("=" * 60)
+        print("\n⚠️  주의: 이 도구들은 고급 사용자용입니다.")
+        print("    잘못 사용하면 데이터 손상이 발생할 수 있습니다.")
+        print("\n1) 🔄 최근 Journal 롤백")
+        print("2) 🧹 로그 파일 정리")
+        print("Q) 메인 메뉴로")
+        
+        choice = input("\n선택> ").strip().lower()
+        
+        if choice == 'q':
+            break
+        elif choice == '1':
+            # 롤백
+            latest = get_latest_journal(base_log_dir)
+            if not latest:
+                print("\n⚠️  최근 저널 파일을 찾을 수 없습니다.")
+                input("계속하려면 Enter...")
                 continue
-
-            if sub == 'n':
-                path_str = input("새로 만들 config JSON 경로 (예: ./configs/my_backup.json): ").strip()
-                if not path_str:
-                    continue
-                config_path = Path(path_str).expanduser()
-                jobs: List[BackupJob] = []
-            else:
-                configs = find_config_files()
-                if not configs:
-                    print("자동 검색된 config 가 없습니다.")
-                    path_str = input("직접 경로 입력 (취소: 빈 줄): ").strip()
-                    if not path_str:
-                        continue
-                    config_path = Path(path_str).expanduser()
-                else:
-                    print("config 목록:")
-                    for idx, c in enumerate(configs, start=1):
-                        print(f"{idx}) {c}")
-                    sel = input("번호 선택 또는 직접 경로 입력: ").strip()
-                    try:
-                        idx = int(sel)
-                        config_path = configs[idx - 1]
-                    except (ValueError, IndexError):
-                        config_path = Path(sel).expanduser()
-
-                try:
-                    jobs = load_config(config_path)
-                except Exception as e:
-                    print(f"config 읽기 실패: {e}")
-                    input("계속하려면 Enter...")
-                    continue
-
-            if jobs:
-                print("0) 새 Job 추가")
-                for idx, j in enumerate(jobs, start=1):
-                    print(f"{idx}) {j.name} (mode={j.mode}, src={j.source}, dst={j.destination})")
-                sel = input("수정할 Job 번호 선택 (0=새 Job): ").strip()
-            else:
-                print("현재 Job 이 없습니다. 새 Job 을 생성합니다.")
-                sel = "0"
-
-            if sel == "0":
-                job = BackupJob(
-                    name="",
-                    source=Path("."),
-                    destination=Path("."),
-                    mode="safety_net",
-                    exclude=[],
-                    safety_net_days=30,
-                    verify=False,
-                )
-                jobs.append(job)
-                editing_job = job
-            else:
-                try:
-                    idx = int(sel)
-                    editing_job = jobs[idx - 1]
-                except Exception:
-                    print("잘못된 선택입니다.")
-                    input("계속하려면 Enter...")
-                    continue
-
-            def edit_field(label: str, current: str) -> str:
-                v = input(f"{label} (현재: {current}) 새 값(Enter=유지): ").strip()
-                return current if v == "" else v
-
-            editing_job.name = edit_field("Job 이름", editing_job.name or "(빈 값)")
-            editing_job.source = Path(edit_field("Source 경로", str(editing_job.source))).expanduser()
-            editing_job.destination = Path(edit_field("Destination 경로", str(editing_job.destination))).expanduser()
-
-            mode_val = edit_field("Mode (clone/sync/safety_net)", editing_job.mode)
-            if mode_val in ("clone", "sync", "safety_net"):
-                editing_job.mode = mode_val
-
-            excl_str_current = ", ".join(editing_job.exclude) if editing_job.exclude else ""
-            excl_str = edit_field("Exclude 패턴(쉼표 구분)", excl_str_current)
-            if excl_str != "":
-                editing_job.exclude = [x.strip() for x in excl_str.split(",") if x.strip()]
-
-            days_str = edit_field("SafetyNet 보관일 수", str(editing_job.safety_net_days))
-            if days_str:
-                try:
-                    editing_job.safety_net_days = int(days_str)
-                except ValueError:
-                    pass
-
-            verify_str = input(f"해시 검증(verify) 사용? (현재: {editing_job.verify}) [y/N]: ").strip().lower()
-            if verify_str in ("y", "yes"):
-                editing_job.verify = True
-            elif verify_str in ("n", "no"):
-                editing_job.verify = False
-
-            raw = {
-                "jobs": [
-                    {
-                        "name": j.name,
-                        "source": str(j.source),
-                        "destination": str(j.destination),
-                        "mode": j.mode,
-                        "exclude": j.exclude,
-                        "safety_net_days": j.safety_net_days,
-                        "verify": j.verify,
-                    }
-                    for j in jobs
-                ]
-            }
+            
             try:
-                config_path.parent.mkdir(parents=True, exist_ok=True)
-                # 원자적 쓰기
-                tmp_path = config_path.with_suffix('.tmp')
-                with tmp_path.open("w", encoding="utf-8") as f:
-                    json.dump(raw, f, indent=2, ensure_ascii=False)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(tmp_path, config_path)
-                print(f"Config 저장 완료: {config_path}")
+                j = load_journal(latest)
+                print(f"\n최근 저널: {latest.name}")
+                print(f"Job: {j.job_name}")
+                print(f"시간: {j.timestamp}")
+                print(f"상태: {j.status}")
+                print(f"\n⚠️  롤백은 신중하게 사용하세요!")
+                print("   백업된 파일이 원래 상태로 되돌아갑니다.")
+                
+                yn = input("\n이 저널로 롤백할까요? [y/N]: ").strip().lower()
+                if yn == 'y':
+                    print("\n롤백 실행 중...")
+                    rollback_journal(j, dry_run=False)
+                    j.status = "rolled_back"
+                    save_journal(j, latest)
+                    print("✅ 롤백 완료.")
+                else:
+                    print("❌ 롤백 취소.")
             except Exception as e:
-                print(f"Config 저장 실패: {e}")
-                try:
-                    if tmp_path.exists():
-                        tmp_path.unlink()
-                except Exception:
-                    pass
-
-            input("계속하려면 Enter...")
-
-        else:
-            continue
+                print(f"\n❌ 롤백 실패: {e}")
+            
+            input("\n계속하려면 Enter...")
+        
+        elif choice == '2':
+            # 로그 정리
+            print("\n로그 파일 정리 (30일 이상)")
+            try:
+                from datetime import timedelta
+                cutoff_date = datetime.now() - timedelta(days=30)
+                
+                old_logs = []
+                for log_file in base_log_dir.glob("disk_sync_pro_*.log"):
+                    try:
+                        mtime = datetime.fromtimestamp(log_file.stat().st_mtime)
+                        if mtime < cutoff_date:
+                            old_logs.append(log_file)
+                    except:
+                        pass
+                
+                if not old_logs:
+                    print("\n✅ 정리할 로그 파일이 없습니다.")
+                else:
+                    print(f"\n발견된 오래된 로그: {len(old_logs)}개")
+                    print("\n⚠️  자동 정리 기능이 활성화되어 있습니다.")
+                    print("   백업 실행 시 자동으로 정리됩니다.")
+            except Exception as e:
+                print(f"\n❌ 로그 확인 실패: {e}")
+            
+            input("\n계속하려면 Enter...")
 
 
 # ================ main 진입점 =================
