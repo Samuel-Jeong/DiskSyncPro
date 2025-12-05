@@ -1,5 +1,5 @@
 # DiskSyncPro  
-Mac용 안전한 디스크 백업/동기화 스크립트  
+Mac용 안전한 디스크 백업/동기화 도구
 (Carbon Copy Cloner + SuperDuper + Time Machine 컨셉)
 
 ---
