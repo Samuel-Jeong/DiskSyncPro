@@ -1,0 +1,20 @@
+{
+  "jobs": [
+    {
+      "name": "WORK-to-WORK_BACKUP",
+      "source": "/Volumes/WORK/GIT_PROJECTS",
+      "destination": "/Volumes/WORK_BACKUP/WORK_GIT_PROJECTS_20260116",
+      "mode": "sync",
+      "exclude": [
+        ".DS_Store",
+        ".Spotlight-V100",
+        ".fseventsd",
+        "node_modules",
+        ".terraform",
+        "*.tmp"
+      ],
+      "safety_net_days": 30,
+      "verify": false
+    }
+  ]
+}

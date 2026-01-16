@@ -2893,11 +2893,14 @@ def curses_prompt(stdscr, prompt: str, maxlen: int = 40) -> str:
 
 def find_config_files() -> List[Path]:
     """
-    현재 디렉토리와 ./configs 에서 *.json 검색
+    현재 디렉토리와 ./config 에서 *.json 검색
     """
     configs: List[Path] = []
     base_dir = Path(__file__).resolve().parent
-    candidates = [Path.cwd(), base_dir / "configs"]
+
+    # 변경 포인트: "configs" -> "config"
+    candidates = [Path.cwd(), base_dir / "config"]
+
     seen = set()
     for d in candidates:
         if not d.exists():
